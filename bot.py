@@ -13,6 +13,13 @@ from aiogram.types import (
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
+# ============ НАСТРОЙКА ЛОГИРОВАНИЯ В САМОМ НАЧАЛЕ ============
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 # ============ НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER ============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID", "717849646")
@@ -20,8 +27,10 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://consullex-bot.onrender.com")
 WEBHOOK_PATH = "/webhook"
 
 if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN не установлен!")
     raise ValueError("❌ BOT_TOKEN не установлен!")
 if not WEBHOOK_URL:
+    logger.error("❌ WEBHOOK_URL не установлен!")
     raise ValueError("❌ WEBHOOK_URL не установлен!")
 
 # ============ ИНИЦИАЛИЗАЦИЯ ============
