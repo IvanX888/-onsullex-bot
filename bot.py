@@ -5,6 +5,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Update
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties  # <-- ЭТУ СТРОЧКУ ДОБАВЬТЕ!
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,8 +25,11 @@ if not BOT_TOKEN:
 if not WEBHOOK_URL:
     raise ValueError("❌ WEBHOOK_URL не установлен!")
 
-# Инициализация бота и диспетчера
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# Инициализация бота с НОВЫМ синтаксисом
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)  # <-- ИЗМЕНИЛИ ЭТУ СТРОКУ!
+)
 dp = Dispatcher()
 
 # ========== КОМАНДЫ БОТА ==========
@@ -75,7 +79,8 @@ async def on_startup(app: web.Application = None):
     webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(webhook_url)
-    logger.info(f"✅ Webhook: {webhook_url}")
+    logger.info(f"✅ Webhook установлен: {webhook_url}")
+    
     me = await bot.get_me()
     logger.info(f"🤖 Бот @{me.username} запущен!")
 
@@ -87,7 +92,11 @@ async def on_shutdown(app: web.Application = None):
 # ========== ВЕБ-СЕРВЕР ==========
 
 async def handle_root(request: web.Request):
-    return web.Response(text="✅ Консуллекс бот работает!")
+    return web.Response(
+        text="✅ Консуллекс бот работает!\n"
+             f"URL: {WEBHOOK_URL}\n"
+             "Статус: Активен"
+    )
 
 def create_app():
     app = web.Application()
