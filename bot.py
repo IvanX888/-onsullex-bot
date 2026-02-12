@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import threading
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -583,7 +584,7 @@ async def end_chat_for_admin(admin_id: int, state: FSMContext, message_text: str
     except Exception as e:
         logger.error(f"❌ Ошибка завершения чата админа {admin_id}: {e}")
 
-# ============ WEBHOOK (ИСПРАВЛЕННЫЙ) ============
+# ============ WEBHOOK ============
 
 async def handle_webhook(request: web.Request):
     """Обработка входящих обновлений от Telegram"""
@@ -604,11 +605,11 @@ async def root_handler(request: web.Request):
     """Корневой URL"""
     return web.Response(text=f"Bot OK. Admin: {ADMIN_ID}")
 
-async def on_startup(app: web.Application):
-    """Запускается ПОСЛЕ старта сервера"""
-    # Небольшая задержка чтобы сервер точно запустился
-    await asyncio.sleep(2)
-    
+# ============ ГЛАВНАЯ ФУНКЦИЯ (ИСПРАВЛЕННАЯ) ============
+
+async def setup_webhook():
+    """Установка webhook после запуска сервера"""
+    await asyncio.sleep(3)  # Ждём полного запуска сервера
     webhook_url = f"{WEBHOOK_URL}/webhook"
     try:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -617,35 +618,35 @@ async def on_startup(app: web.Application):
     except Exception as e:
         logger.error(f"❌ Ошибка установки webhook: {e}")
 
-async def on_shutdown(app: web.Application):
-    """При завершении работы"""
-    try:
-        await bot.delete_webhook()
-        await bot.session.close()
-    except Exception as e:
-        logger.error(f"❌ Ошибка shutdown: {e}")
-
-# ============ ГЛАВНАЯ ФУНКЦИЯ ============
-
-def main():
-    # Создаём приложение aiohttp
+def run_server():
+    """Запуск сервера в отдельном потоке"""
     app = web.Application()
-    
-    # Роуты (маршруты) - ВАЖНО: добавляем ДО запуска сервера
     app.router.add_get("/", root_handler)
     app.router.add_get("/health", health_check)
     app.router.add_post("/webhook", handle_webhook)
     
-    # Обработчики событий
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    
-    # Получаем порт
     port = int(os.getenv("PORT", "10000"))
+    logger.info(f"🚀 Запуск сервера на порту {port}...")
     
     # Запускаем сервер
-    logger.info(f"🚀 Запуск сервера на порту {port}...")
     web.run_app(app, host="0.0.0.0", port=port)
 
+async def main():
+    """Главная функция"""
+    # Запускаем сервер в отдельном потоке, чтобы не блокировать
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    
+    # Даём серверу время запуститься
+    await asyncio.sleep(2)
+    
+    # Устанавливаем webhook
+    await setup_webhook()
+    
+    # Держим программу живой
+    while True:
+        await asyncio.sleep(60)  # Проверка каждую минуту
+        logger.info("💓 Бот работает...")
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
