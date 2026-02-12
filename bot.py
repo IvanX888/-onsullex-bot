@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -49,7 +50,6 @@ active_chats = {}
 
 # ============ КЛАВИАТУРЫ ============
 
-# КЛИЕНТСКИЕ КЛАВИАТУРЫ
 def client_main_menu():
     """Главное меню клиента"""
     return ReplyKeyboardMarkup(
@@ -71,7 +71,6 @@ def client_in_chat_menu():
         resize_keyboard=True
     )
 
-# АДМИНСКИЕ КЛАВИАТУРЫ
 def admin_idle_menu():
     """Меню админа когда свободен"""
     return ReplyKeyboardMarkup(
@@ -294,6 +293,10 @@ async def client_end_chat(message: Message, state: FSMContext):
         await end_chat_for_admin(admin_id, dp.fsm.get_context(bot, admin_id, admin_id), "Клиент завершил диалог")
     
     await end_chat_for_client(uid, "Вы завершили разговор с юристом")
+
+@dp.message(StateFilter(ClientState.talking_to_lawyer), F.text == "📞 Телефон для связи")
+async def client_phone_in_chat(message: Message, state: FSMContext):
+    await message.answer("📞 +7 (977) 42-32-473 (WhatsApp/Telegram)")
 
 @dp.message(StateFilter(ClientState.talking_to_lawyer))
 async def client_to_lawyer_message(message: Message, state: FSMContext):
@@ -580,9 +583,10 @@ async def end_chat_for_admin(admin_id: int, state: FSMContext, message_text: str
     except Exception as e:
         logger.error(f"❌ Ошибка завершения чата админа {admin_id}: {e}")
 
-# ============ WEBHOOK ============
+# ============ WEBHOOK (ИСПРАВЛЕННЫЙ) ============
 
 async def handle_webhook(request: web.Request):
+    """Обработка входящих обновлений от Telegram"""
     try:
         data = await request.json()
         update = Update.model_validate(data, context={"bot": bot})
@@ -592,29 +596,56 @@ async def handle_webhook(request: web.Request):
         logger.error(f"❌ Webhook error: {e}")
         return web.Response(text="Error", status=200)
 
-async def on_startup(app: web.Application = None):
+async def health_check(request: web.Request):
+    """Health check для Render"""
+    return web.Response(text="OK")
+
+async def root_handler(request: web.Request):
+    """Корневой URL"""
+    return web.Response(text=f"Bot OK. Admin: {ADMIN_ID}")
+
+async def on_startup(app: web.Application):
+    """Запускается ПОСЛЕ старта сервера"""
+    # Небольшая задержка чтобы сервер точно запустился
+    await asyncio.sleep(2)
+    
     webhook_url = f"{WEBHOOK_URL}/webhook"
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_webhook(webhook_url)
         logger.info(f"✅ Webhook установлен: {webhook_url}")
     except Exception as e:
-        logger.error(f"❌ Ошибка webhook: {e}")
+        logger.error(f"❌ Ошибка установки webhook: {e}")
 
-async def on_shutdown(app: web.Application = None):
+async def on_shutdown(app: web.Application):
+    """При завершении работы"""
     try:
         await bot.delete_webhook()
         await bot.session.close()
     except Exception as e:
         logger.error(f"❌ Ошибка shutdown: {e}")
 
-app = web.Application()
-app.router.add_post("/webhook", handle_webhook)
-app.router.add_get("/", lambda r: web.Response(text=f"Bot OK. Admin: {ADMIN_ID}"))
-app.router.add_get("/health", lambda r: web.Response(text="OK"))
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
+# ============ ГЛАВНАЯ ФУНКЦИЯ ============
+
+def main():
+    # Создаём приложение aiohttp
+    app = web.Application()
+    
+    # Роуты (маршруты) - ВАЖНО: добавляем ДО запуска сервера
+    app.router.add_get("/", root_handler)
+    app.router.add_get("/health", health_check)
+    app.router.add_post("/webhook", handle_webhook)
+    
+    # Обработчики событий
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    # Получаем порт
+    port = int(os.getenv("PORT", "10000"))
+    
+    # Запускаем сервер
+    logger.info(f"🚀 Запуск сервера на порту {port}...")
+    web.run_app(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    web.run_app(app, host="0.0.0.0", port=port)
+    main()
