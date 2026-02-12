@@ -193,10 +193,12 @@ def admin_idle_menu():
     )
 
 def admin_in_chat_menu(client_name: str):
+    """Клавиатура админа во время диалога с клиентом (с горячими кнопками)."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=f"❌ Завершить диалог с {client_name}")],
-            [KeyboardButton(text="📊 Статистика")]
+            [KeyboardButton(text="💰 Прайс-лист"), KeyboardButton(text="📞 Запросить контакты")],
+            [KeyboardButton(text="❌ Не можем помочь"), KeyboardButton(text="📊 Статистика")]
         ],
         resize_keyboard=True
     )
@@ -216,6 +218,41 @@ BOT_ANSWERS = {
     "спасибо": "🙏 Пожалуйста! Обращайтесь ещё.",
     "до свидания": "👋 До свидания!",
 }
+
+# ---------- Горячие ответы для админа ----------
+PRICE_LIST = """
+<b>💰 Наши цены:</b>
+
+• Устная консультация — 3 000 ₽
+• Письменная консультация — 5 000 ₽
+• Анализ документов — 4 000 ₽
+• Составление договора — от 7 000 ₽
+• Претензия, жалоба — от 5 000 ₽
+• Исковое заявление — от 10 000 ₽
+• Представительство в суде — от 20 000 ₽
+• Срочный выезд — от 15 000 ₽
+
+<i>Точная стоимость зависит от сложности.</i>
+"""
+
+ASK_CONTACTS = """
+📝 <b>Оставьте ваши контакты</b>
+
+Пожалуйста, напишите:
+1. Ваше ФИО
+2. Номер телефона для связи
+3. Краткое описание вопроса
+
+Я свяжусь с вами в ближайшее время.
+"""
+
+CANNOT_HELP = """
+❌ <b>К сожалению, мы не можем помочь вам с этим вопросом.</b>
+
+Рекомендуем обратиться к другим специалистам или в профильные юридические конторы.
+
+Спасибо за обращение!
+"""
 
 # ============ ОБРАБОТЧИКИ ============
 
@@ -301,13 +338,10 @@ async def client_call_lawyer(message: Message, state: FSMContext):
     existing_admin = await get_active_chat(uid)
     if existing_admin:
         logger.info(f"🔄 Клиент {uid} переподключается. Завершаем старый диалог с админом {existing_admin}.")
-        # Завершаем диалог для админа (сбрасываем его состояние и уведомляем)
         admin_state = get_fsm_context(existing_admin)
         await end_chat_for_admin(existing_admin, admin_state, "Клиент начал новый диалог")
-        # Завершаем диалог для клиента (удаляем active_chat, сбрасываем состояние)
         await end_chat_for_client(uid, "Старый диалог завершён (новое обращение)")
 
-    # Теперь устанавливаем новое состояние
     await state.set_state(ClientState.talking_to_lawyer)
 
     await message.answer(
@@ -418,7 +452,6 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
     client_id = int(parts[1])
     client_name = parts[2] if len(parts) > 2 else "Клиент"
 
-    # 🔥 Разрешаем тому же админу подключаться, даже если клиент уже в active_chats с ним же (старая кнопка)
     existing_admin = await get_active_chat(client_id)
     if existing_admin and existing_admin != callback.from_user.id:
         logger.warning(f"⚠️ Админ {callback.from_user.id} пытался подключиться к клиенту {client_id}, но он уже в чате с {existing_admin}")
@@ -428,10 +461,8 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
     # Если клиент уже в active_chats с этим же админом — перезапускаем диалог
     if existing_admin == callback.from_user.id:
         logger.info(f"🔄 Админ {callback.from_user.id} повторно нажал на кнопку клиента {client_id}. Перезапускаем диалог.")
-        # Завершаем старый диалог для админа (если он в состоянии чата)
         admin_state = get_fsm_context(callback.from_user.id)
         await end_chat_for_admin(callback.from_user.id, admin_state, "Диалог перезапущен")
-        # Удаляем клиента из active_chats (чтобы чисто начать)
         await remove_active_chat(client_id)
 
     await state.set_state(AdminState.talking_to_client)
@@ -462,6 +493,80 @@ async def admin_end_chat(message: Message, state: FSMContext):
         await end_chat_for_client(client_id, "Юрист завершил консультацию")
         await end_chat_for_admin(message.from_user.id, state, f"Диалог с {client_name} завершён")
 
+# ---------- Горячие кнопки админа (быстрые ответы) ----------
+@dp.message(StateFilter(AdminState.talking_to_client), F.text == "💰 Прайс-лист")
+async def admin_send_price_list(message: Message, state: FSMContext):
+    data = await state.get_data()
+    client_id = data.get('talking_to')
+    if not client_id:
+        await message.answer("⚠️ Нет активного клиента")
+        return
+
+    if not await get_active_chat(client_id):
+        await message.answer("⚠️ Клиент отключился или завершил диалог")
+        # Завершаем состояние админа, чтобы не зависло
+        await state.clear()
+        await state.set_state(AdminState.idle)
+        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
+        return
+
+    sent = await safe_send_message(client_id, PRICE_LIST, parse_mode=ParseMode.HTML)
+    if sent:
+        await message.answer("✅ Прайс-лист отправлен клиенту")
+    else:
+        await message.answer("❌ Не удалось отправить прайс-лист")
+
+@dp.message(StateFilter(AdminState.talking_to_client), F.text == "📞 Запросить контакты")
+async def admin_ask_contacts(message: Message, state: FSMContext):
+    data = await state.get_data()
+    client_id = data.get('talking_to')
+    if not client_id:
+        await message.answer("⚠️ Нет активного клиента")
+        return
+
+    if not await get_active_chat(client_id):
+        await message.answer("⚠️ Клиент отключился или завершил диалог")
+        await state.clear()
+        await state.set_state(AdminState.idle)
+        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
+        return
+
+    sent = await safe_send_message(client_id, ASK_CONTACTS, parse_mode=ParseMode.HTML)
+    if sent:
+        await message.answer("✅ Запрос контактов отправлен клиенту")
+    else:
+        await message.answer("❌ Не удалось отправить запрос")
+
+@dp.message(StateFilter(AdminState.talking_to_client), F.text == "❌ Не можем помочь")
+async def admin_cannot_help(message: Message, state: FSMContext):
+    data = await state.get_data()
+    client_id = data.get('talking_to')
+    if not client_id:
+        await message.answer("⚠️ Нет активного клиента")
+        return
+
+    if not await get_active_chat(client_id):
+        await message.answer("⚠️ Клиент отключился или завершил диалог")
+        await state.clear()
+        await state.set_state(AdminState.idle)
+        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
+        return
+
+    sent = await safe_send_message(client_id, CANNOT_HELP, parse_mode=ParseMode.HTML)
+    if sent:
+        await message.answer("✅ Уведомление об отказе отправлено клиенту")
+    else:
+        await message.answer("❌ Не удалось отправить уведомление")
+
+# ---------- Статистика (работает в любом состоянии админа) ----------
+@dp.message(F.text == "📊 Статистика", F.from_user.id == ADMIN_ID)
+async def admin_stats(message: Message, state: FSMContext):
+    chats = await get_all_active_chats()
+    count = len(chats)
+    clients = list(chats.keys())
+    await message.answer(f"📊 Активных диалогов: {count}\nКлиенты: {clients if clients else 'нет'}")
+
+# ---------- Обработка обычных сообщений админа в чате ----------
 @dp.message(StateFilter(AdminState.talking_to_client))
 async def admin_to_client(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -513,21 +618,12 @@ async def admin_to_client(message: Message, state: FSMContext):
         logger.error(f"❌ Ошибка отправки админом: {e}")
         await message.answer("❌ Ошибка отправки")
 
-@dp.message(StateFilter(AdminState.idle), F.text == "📊 Статистика")
-async def admin_stats_idle(message: Message, state: FSMContext):
-    chats = await get_all_active_chats()
-    count = len(chats)
-    clients = list(chats.keys())
-    await message.answer(f"📊 Активных диалогов: {count}\nКлиенты: {clients if clients else 'нет'}")
-
-@dp.message(StateFilter(AdminState.idle), F.text == "🔄 Перезапустить бота")
-async def admin_restart(message: Message, state: FSMContext):
-    await cmd_start(message, state)
-
+# ---------- Обработчик для свободного админа ----------
 @dp.message(StateFilter(AdminState.idle))
 async def admin_idle(message: Message, state: FSMContext):
     if message.text and message.text.startswith('/'):
         return
+    # Если админ в idle и нажал статистику — обработается выше, сюда не попадёт
     await message.answer("ℹ️ Вы свободны. Ждите клиента или нажмите /start", reply_markup=admin_idle_menu())
 
 # ============ WEBHOOK С БЕЗОПАСНОЙ ОЧЕРЕДЬЮ ============
