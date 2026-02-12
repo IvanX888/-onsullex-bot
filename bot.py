@@ -46,7 +46,11 @@ storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=storage)
 
-# ---------- Защита active_chats ----------
+# ---------- Очередь вебхуков и воркер ----------
+update_queue = asyncio.Queue()
+_worker_task = None
+
+# ---------- Защищённый словарь активных чатов ----------
 active_chats = {}
 active_chats_lock = asyncio.Lock()
 
@@ -58,9 +62,110 @@ async def remove_active_chat(client_id: int):
     async with active_chats_lock:
         active_chats.pop(client_id, None)
 
-async def get_active_chat(client_id: int):
+async def get_active_chat(client_id: int) -> int | None:
     async with active_chats_lock:
         return active_chats.get(client_id)
+
+async def get_all_active_chats():
+    async with active_chats_lock:
+        return active_chats.copy()
+
+# ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+def get_fsm_context(user_id: int, chat_id: int = None) -> FSMContext:
+    if chat_id is None:
+        chat_id = user_id
+    key = StorageKey(bot_id=bot.id, user_id=user_id, chat_id=chat_id)
+    return FSMContext(storage=dp.storage, key=key)
+
+# ---------- Отправка с таймаутом ----------
+async def safe_send_message(chat_id: int, text: str, **kwargs):
+    try:
+        await asyncio.wait_for(
+            bot.send_message(chat_id, text, **kwargs),
+            timeout=15.0
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"⏰ Таймаут отправки сообщения для {chat_id}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки сообщения для {chat_id}: {e}")
+        return False
+
+async def safe_send_photo(chat_id: int, photo, caption: str = None, **kwargs):
+    try:
+        await asyncio.wait_for(
+            bot.send_photo(chat_id, photo, caption=caption, **kwargs),
+            timeout=20.0
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"⏰ Таймаут отправки фото для {chat_id}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки фото для {chat_id}: {e}")
+        return False
+
+async def safe_send_document(chat_id: int, document, caption: str = None, **kwargs):
+    try:
+        await asyncio.wait_for(
+            bot.send_document(chat_id, document, caption=caption, **kwargs),
+            timeout=20.0
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"⏰ Таймаут отправки документа для {chat_id}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки документа для {chat_id}: {e}")
+        return False
+
+async def safe_send_voice(chat_id: int, voice, caption: str = None, **kwargs):
+    try:
+        await asyncio.wait_for(
+            bot.send_voice(chat_id, voice, caption=caption, **kwargs),
+            timeout=20.0
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"⏰ Таймаут отправки голосового для {chat_id}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки голосового для {chat_id}: {e}")
+        return False
+
+# ---------- Завершение диалога ----------
+async def end_chat_for_client(client_id: int, text: str):
+    """Полное и гарантированное завершение диалога со стороны клиента."""
+    try:
+        # Сначала удаляем из active_chats (всегда)
+        await remove_active_chat(client_id)
+    except Exception as e:
+        logger.error(f"Ошибка при удалении active_chat {client_id}: {e}")
+    finally:
+        # Сбрасываем состояние клиента
+        client_state = get_fsm_context(client_id)
+        await client_state.clear()
+        await client_state.set_state(ClientState.menu)
+
+        # Отправляем уведомление (если получится)
+        await safe_send_message(
+            client_id,
+            f"👨‍⚖️ <b>{text}</b>\n\nНажмите 👨‍⚖️ Связаться с юристом снова",
+            reply_markup=client_main_menu(),
+            parse_mode=ParseMode.HTML
+        )
+
+async def end_chat_for_admin(admin_id: int, state: FSMContext, text: str):
+    """Завершение диалога со стороны админа."""
+    await state.clear()
+    await state.set_state(AdminState.idle)
+    await safe_send_message(
+        admin_id,
+        f"✅ {text}\n\nВы свободны",
+        reply_markup=admin_idle_menu(),
+        parse_mode=ParseMode.HTML
+    )
 
 # ============ КЛАВИАТУРЫ ============
 def client_main_menu():
@@ -116,90 +221,6 @@ BOT_ANSWERS = {
     "до свидания": "👋 До свидания!",
 }
 
-# ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ FSM ============
-def get_fsm_context(user_id: int, chat_id: int = None) -> FSMContext:
-    """Корректное получение контекста FSM для пользователя."""
-    if chat_id is None:
-        chat_id = user_id
-    key = StorageKey(bot_id=bot.id, user_id=user_id, chat_id=chat_id)
-    return FSMContext(storage=dp.storage, key=key)
-
-# ============ ОТПРАВКА С ТАЙМАУТОМ ============
-async def safe_send_message(chat_id: int, text: str, **kwargs):
-    """Отправляет сообщение с таймаутом 15 секунд."""
-    try:
-        await asyncio.wait_for(
-            bot.send_message(chat_id, text, **kwargs),
-            timeout=15.0
-        )
-        return True
-    except asyncio.TimeoutError:
-        logger.error(f"Таймаут отправки сообщения для {chat_id}")
-        return False
-    except Exception as e:
-        logger.error(f"Ошибка отправки сообщения для {chat_id}: {e}")
-        return False
-
-async def safe_send_photo(chat_id: int, photo, caption: str = None, **kwargs):
-    try:
-        await asyncio.wait_for(
-            bot.send_photo(chat_id, photo, caption=caption, **kwargs),
-            timeout=20.0
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка отправки фото для {chat_id}: {e}")
-        return False
-
-async def safe_send_document(chat_id: int, document, caption: str = None, **kwargs):
-    try:
-        await asyncio.wait_for(
-            bot.send_document(chat_id, document, caption=caption, **kwargs),
-            timeout=20.0
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка отправки документа для {chat_id}: {e}")
-        return False
-
-async def safe_send_voice(chat_id: int, voice, caption: str = None, **kwargs):
-    try:
-        await asyncio.wait_for(
-            bot.send_voice(chat_id, voice, caption=caption, **kwargs),
-            timeout=20.0
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка отправки голосового для {chat_id}: {e}")
-        return False
-
-# ============ ЗАВЕРШЕНИЕ ДИАЛОГА ============
-async def end_chat_for_client(client_id: int, text: str):
-    """Завершает диалог со стороны клиента или автоматически."""
-    await remove_active_chat(client_id)
-    
-    client_state = get_fsm_context(client_id)
-    await client_state.clear()
-    await client_state.set_state(ClientState.menu)
-    
-    await safe_send_message(
-        client_id,
-        f"👨‍⚖️ <b>{text}</b>\n\nНажмите 👨‍⚖️ Связаться с юристом снова",
-        reply_markup=client_main_menu(),
-        parse_mode=ParseMode.HTML
-    )
-
-async def end_chat_for_admin(admin_id: int, state: FSMContext, text: str):
-    """Завершает диалог со стороны админа."""
-    await state.clear()
-    await state.set_state(AdminState.idle)
-    await safe_send_message(
-        admin_id,
-        f"✅ {text}\n\nВы свободны",
-        reply_markup=admin_idle_menu(),
-        parse_mode=ParseMode.HTML
-    )
-
 # ============ ОБРАБОТЧИКИ ============
 
 @dp.message(Command("start"))
@@ -207,7 +228,7 @@ async def cmd_start(message: Message, state: FSMContext):
     uid = message.from_user.id
     await state.clear()
     await remove_active_chat(uid)
-    
+
     if is_admin(uid):
         await state.set_state(AdminState.idle)
         await message.answer(
@@ -230,7 +251,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def cmd_stop(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    
+
     uid = message.from_user.id
     client_id = None
     async with active_chats_lock:
@@ -238,7 +259,7 @@ async def cmd_stop(message: Message, state: FSMContext):
             if aid == uid:
                 client_id = cid
                 break
-    
+
     if client_id:
         await end_chat_for_client(client_id, "Админ завершил диалог")
         await end_chat_for_admin(uid, state, "Диалог завершён")
@@ -247,8 +268,7 @@ async def cmd_stop(message: Message, state: FSMContext):
         await state.set_state(AdminState.idle)
         await message.answer("✅ Сброшено", reply_markup=admin_idle_menu())
 
-# ============ КЛИЕНТ ============
-
+# ---------- КЛИЕНТ ----------
 @dp.message(StateFilter(ClientState.menu), F.text == "📝 Оставить заявку")
 async def client_request(message: Message, state: FSMContext):
     await message.answer(
@@ -280,14 +300,15 @@ async def client_faq(message: Message, state: FSMContext):
 async def client_call_lawyer(message: Message, state: FSMContext):
     uid = message.from_user.id
     user = message.from_user
-    
+
+    # 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: принудительно завершаем старый диалог, если он есть
     existing = await get_active_chat(uid)
     if existing:
-        await message.answer("⚠️ Вы уже на связи!")
-        return
-    
+        logger.info(f"🔄 Клиент {uid} переподключается. Завершаем старый диалог с админом {existing}.")
+        await end_chat_for_client(uid, "Старый диалог завершён (новое обращение)")
+
     await state.set_state(ClientState.talking_to_lawyer)
-    
+
     await message.answer(
         "⏳ <b>Соединяю с юристом...</b>\n\n"
         "✅ Иван Серко получил уведомление.\n\n"
@@ -295,7 +316,7 @@ async def client_call_lawyer(message: Message, state: FSMContext):
         reply_markup=client_in_chat_menu(),
         parse_mode=ParseMode.HTML
     )
-    
+
     try:
         await safe_send_message(
             ADMIN_ID,
@@ -326,29 +347,37 @@ async def client_end_chat(message: Message, state: FSMContext):
 async def client_to_lawyer(message: Message, state: FSMContext):
     uid = message.from_user.id
     user = message.from_user
-    
+
     admin_id = await get_active_chat(uid)
     if not admin_id:
         await message.answer("⚠️ Связь с юристом потеряна. Начните заново.", reply_markup=client_main_menu())
         await state.set_state(ClientState.menu)
         return
-    
+
     sent = False
     try:
         header = f"💬 <b>{user.full_name}</b>\n—\n"
         if message.text:
             sent = await safe_send_message(admin_id, header + message.text, parse_mode=ParseMode.HTML)
         elif message.photo:
-            sent = await safe_send_photo(admin_id, message.photo[-1].file_id, caption=header + (message.caption or ""), parse_mode=ParseMode.HTML)
+            sent = await safe_send_photo(
+                admin_id, message.photo[-1].file_id,
+                caption=header + (message.caption or ""),
+                parse_mode=ParseMode.HTML
+            )
         elif message.document:
-            sent = await safe_send_document(admin_id, message.document.file_id, caption=header + (message.caption or ""), parse_mode=ParseMode.HTML)
+            sent = await safe_send_document(
+                admin_id, message.document.file_id,
+                caption=header + (message.caption or ""),
+                parse_mode=ParseMode.HTML
+            )
         elif message.voice:
             await safe_send_message(admin_id, f"💬 <b>{user.full_name}</b>\n—\n🎤 Голосовое:", parse_mode=ParseMode.HTML)
             sent = await safe_send_voice(admin_id, message.voice.file_id, parse_mode=ParseMode.HTML)
         else:
             await message.reply("❌ Неподдерживаемый тип сообщения")
             return
-        
+
         data = await state.get_data()
         if not data.get('notified'):
             await state.update_data(notified=True)
@@ -372,39 +401,45 @@ async def client_bot_chat(message: Message, state: FSMContext):
         answer = "🤔 Нажмите 👨‍⚖️ Связаться с юристом для помощи"
     await message.answer(answer, reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
 
-# ============ АДМИН ============
-
+# ---------- АДМИН ----------
 @dp.callback_query(F.data.startswith("start_chat:"))
 async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
-    
+
     current_state = await state.get_state()
     if current_state == AdminState.talking_to_client:
         await callback.answer("⚠️ Вы уже ведёте диалог. Завершите его сначала.", show_alert=True)
         return
-    
+
     parts = callback.data.split(":")
     client_id = int(parts[1])
     client_name = parts[2] if len(parts) > 2 else "Клиент"
-    
+
+    # Проверяем, не занят ли клиент другим админом
     existing_admin = await get_active_chat(client_id)
     if existing_admin:
-        await callback.answer("⚠️ Клиент уже на связи с другим админом.", show_alert=True)
+        logger.warning(f"⚠️ Админ {callback.from_user.id} пытался подключиться к клиенту {client_id}, но он уже в чате с {existing_admin}")
+        await callback.answer("⚠️ Клиент уже находится в активном чате. Возможно, это новое обращение — нажмите на свежее уведомление.", show_alert=True)
         return
-    
+
     await state.set_state(AdminState.talking_to_client)
     await state.update_data(talking_to=client_id, client_name=client_name)
     await set_active_chat(client_id, callback.from_user.id)
-    
+
     await callback.message.answer(
         f"✍️ Общение с <b>{client_name}</b>\nID: <code>{client_id}</code>",
         reply_markup=admin_in_chat_menu(client_name),
         parse_mode=ParseMode.HTML
     )
-    
-    await safe_send_message(client_id, "👨‍⚖️ <b>Юрист подключился!</b>", parse_mode=ParseMode.HTML)
+
+    await safe_send_message(
+        client_id,
+        "👨‍⚖️ <b>Юрист подключился!</b>",
+        parse_mode=ParseMode.HTML
+    )
+
     await callback.answer("✅ Подключены")
 
 @dp.message(StateFilter(AdminState.talking_to_client), F.text.startswith("❌ Завершить диалог с"))
@@ -412,7 +447,7 @@ async def admin_end_chat(message: Message, state: FSMContext):
     data = await state.get_data()
     client_id = data.get('talking_to')
     client_name = data.get('client_name', 'Клиент')
-    
+
     if client_id:
         await end_chat_for_client(client_id, "Юрист завершил консультацию")
         await end_chat_for_admin(message.from_user.id, state, f"Диалог с {client_name} завершён")
@@ -421,37 +456,45 @@ async def admin_end_chat(message: Message, state: FSMContext):
 async def admin_to_client(message: Message, state: FSMContext):
     data = await state.get_data()
     client_id = data.get('talking_to')
-    
+
     if not client_id:
         await message.answer("⚠️ Нет активного клиента")
         await state.clear()
         await state.set_state(AdminState.idle)
         await message.answer("Вы свободны", reply_markup=admin_idle_menu())
         return
-    
+
     if not await get_active_chat(client_id):
         await message.answer("⚠️ Клиент отключился или завершил диалог")
         await state.clear()
         await state.set_state(AdminState.idle)
         await message.answer("Вы свободны", reply_markup=admin_idle_menu())
         return
-    
+
     header = "👨‍⚖️ <b>Иван Серко:</b>\n\n"
     sent = False
     try:
         if message.text:
             sent = await safe_send_message(client_id, header + message.text, parse_mode=ParseMode.HTML)
         elif message.photo:
-            sent = await safe_send_photo(client_id, message.photo[-1].file_id, caption=header + (message.caption or ""), parse_mode=ParseMode.HTML)
+            sent = await safe_send_photo(
+                client_id, message.photo[-1].file_id,
+                caption=header + (message.caption or ""),
+                parse_mode=ParseMode.HTML
+            )
         elif message.document:
-            sent = await safe_send_document(client_id, message.document.file_id, caption=header + (message.caption or ""), parse_mode=ParseMode.HTML)
+            sent = await safe_send_document(
+                client_id, message.document.file_id,
+                caption=header + (message.caption or ""),
+                parse_mode=ParseMode.HTML
+            )
         elif message.voice:
             await safe_send_message(client_id, header, parse_mode=ParseMode.HTML)
             sent = await safe_send_voice(client_id, message.voice.file_id, parse_mode=ParseMode.HTML)
         else:
             await message.answer("❌ Неподдерживаемый тип")
             return
-        
+
         if sent:
             await message.answer("✅ Отправлено")
         else:
@@ -462,9 +505,9 @@ async def admin_to_client(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(AdminState.idle), F.text == "📊 Статистика")
 async def admin_stats_idle(message: Message, state: FSMContext):
-    async with active_chats_lock:
-        count = len(active_chats)
-        clients = list(active_chats.keys())
+    chats = await get_all_active_chats()
+    count = len(chats)
+    clients = list(chats.keys())
     await message.answer(f"📊 Активных диалогов: {count}\nКлиенты: {clients if clients else 'нет'}")
 
 @dp.message(StateFilter(AdminState.idle), F.text == "🔄 Перезапустить бота")
@@ -477,24 +520,29 @@ async def admin_idle(message: Message, state: FSMContext):
         return
     await message.answer("ℹ️ Вы свободны. Ждите клиента или нажмите /start", reply_markup=admin_idle_menu())
 
-# ============ WEBHOOK (ИСПРАВЛЕННЫЙ) ============
+# ============ WEBHOOK С БЕЗОПАСНОЙ ОЧЕРЕДЬЮ ============
+async def update_worker():
+    logger.info("🔄 Webhook worker запущен")
+    while True:
+        try:
+            update_data = await update_queue.get()
+            await dp.feed_raw_update(bot, update_data)
+        except asyncio.CancelledError:
+            logger.info("🛑 Webhook worker остановлен")
+            break
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка при обработке апдейта: {e}", exc_info=True)
+        finally:
+            update_queue.task_done()
 
 async def handle_webhook(request: web.Request):
-    """Обработка входящих обновлений от Telegram."""
     try:
         data = await request.json()
-        update_id = data.get('update_id', 'unknown')
-        logger.info(f"📩 Получен webhook: {update_id}")
-        
-        # ОБРАБАТЫВАЕМ СИНХРОННО, ждём результата!
-        # Это важно для правильной работы FSM
-        result = await dp.feed_raw_update(bot, data)
-        
-        logger.info(f"✅ Обработан webhook: {update_id}")
+        logger.info(f"📩 Webhook enqueued: {data.get('update_id', 'unknown')}")
+        await update_queue.put(data)
         return web.Response(text="OK", status=200)
-        
     except Exception as e:
-        logger.error(f"❌ Ошибка webhook: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка при приёме webhook: {e}", exc_info=True)
         return web.Response(text="Error", status=200)
 
 async def health(request: web.Request):
@@ -503,27 +551,46 @@ async def health(request: web.Request):
 async def root(request: web.Request):
     return web.Response(text=f"Bot OK. Admin: {ADMIN_ID}")
 
-# ============ ГЛАВНАЯ ФУНКЦИЯ ============
+async def start_worker(app):
+    global _worker_task
+    _worker_task = asyncio.create_task(update_worker(), name="webhook-worker")
 
-def main():
-    """Главная функция - запускает сервер."""
+async def stop_worker(app):
+    global _worker_task
+    if _worker_task:
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            pass
+        _worker_task = None
+
+# ============ ГЛАВНАЯ ФУНКЦИЯ ============
+async def main():
     port = int(os.getenv("PORT", "10000"))
-    
+
     app = web.Application()
+    app.on_startup.append(start_worker)
+    app.on_shutdown.append(stop_worker)
     app.router.add_get("/", root)
     app.router.add_get("/health", health)
     app.router.add_post("/webhook", handle_webhook)
-    
-    logger.info(f"🚀 Запуск сервера на порту {port}...")
-    
-    # Запускаем сервер (блокирует поток)
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=port,
-        access_log=logger,
-        print=None
-    )
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"🚀 Сервер запущен на порту {port}")
+
+    webhook_url = f"{WEBHOOK_URL}/webhook"
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(webhook_url)
+        logger.info(f"✅ Webhook установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка установки webhook: {e}")
+
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
