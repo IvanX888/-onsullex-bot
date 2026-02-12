@@ -17,12 +17,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.base import StorageKey
 
+# ============ ЛОГИРОВАНИЕ ============
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# ============ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "717849646"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://consullex-bot.onrender.com")
@@ -49,11 +51,11 @@ storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=storage)
 
-# ---------- Очередь вебхуков ----------
+# ---------- ОЧЕРЕДЬ ВЕБХУКОВ ----------
 update_queue = asyncio.Queue()
 _worker_task = None
 
-# ---------- Активные чаты ----------
+# ---------- АКТИВНЫЕ ЧАТЫ ----------
 active_chats = {}
 active_chats_lock = asyncio.Lock()
 
@@ -76,12 +78,15 @@ async def get_all_active_chats():
     async with active_chats_lock:
         return active_chats.copy()
 
-# ---------- База клиентов ----------
+# ---------- БАЗА КЛИЕНТОВ ----------
 clients_db = {}
 clients_db_lock = asyncio.Lock()
 
-async def update_client_info(user_id: int, name: str = None, username: str = None):
-    """Обновляет или создаёт запись о клиенте."""
+async def update_client_info(user_id: int, name: str = None, username: str = None, increment_messages: bool = False):
+    """Создаёт или обновляет запись о клиенте. Не создаёт запись для админа."""
+    if user_id == ADMIN_ID:
+        return  # админа не сохраняем в клиенты
+
     async with clients_db_lock:
         now = datetime.now().isoformat()
         if user_id not in clients_db:
@@ -103,9 +108,13 @@ async def update_client_info(user_id: int, name: str = None, username: str = Non
                 clients_db[user_id]["name"] = name
             if username is not None:
                 clients_db[user_id]["username"] = username
-        clients_db[user_id]["total_messages"] += 1
+
+        if increment_messages:
+            clients_db[user_id]["total_messages"] += 1
 
 async def is_client_banned(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return False
     async with clients_db_lock:
         return clients_db.get(user_id, {}).get("banned", False)
 
@@ -115,7 +124,7 @@ async def set_client_ban(user_id: int, ban: bool, reason: str = None):
             clients_db[user_id]["banned"] = ban
             clients_db[user_id]["ban_reason"] = reason
         else:
-            # На случай, если баним ещё не заходившего клиента (например, по ID из админки)
+            # если клиент ещё не появлялся – создаём запись
             clients_db[user_id] = {
                 "id": user_id,
                 "name": f"User{user_id}",
@@ -143,7 +152,7 @@ def get_fsm_context(user_id: int, chat_id: int = None) -> FSMContext:
     key = StorageKey(bot_id=bot.id, user_id=user_id, chat_id=chat_id)
     return FSMContext(storage=dp.storage, key=key)
 
-# ---------- Отправка с таймаутом ----------
+# ---------- ОТПРАВКА С ТАЙМАУТОМ ----------
 async def safe_send_message(chat_id: int, text: str, **kwargs):
     try:
         await asyncio.wait_for(
@@ -200,23 +209,19 @@ async def safe_send_voice(chat_id: int, voice, caption: str = None, **kwargs):
         logger.error(f"❌ Ошибка отправки голосового для {chat_id}: {e}")
         return False
 
-# ---------- Завершение диалога ----------
+# ---------- ЗАВЕРШЕНИЕ ДИАЛОГА ----------
 async def end_chat_for_client(client_id: int, text: str):
     logger.info(f"🔚 Завершение диалога для клиента {client_id}: {text}")
-    try:
-        await remove_active_chat(client_id)
-    except Exception as e:
-        logger.error(f"Ошибка при удалении active_chat {client_id}: {e}")
-    finally:
-        client_state = get_fsm_context(client_id)
-        await client_state.clear()
-        await client_state.set_state(ClientState.menu)
-        await safe_send_message(
-            client_id,
-            f"👨‍⚖️ <b>{text}</b>\n\nНажмите 👨‍⚖️ Связаться с юристом снова",
-            reply_markup=client_main_menu(),
-            parse_mode=ParseMode.HTML
-        )
+    await remove_active_chat(client_id)
+    client_state = get_fsm_context(client_id)
+    await client_state.clear()
+    await client_state.set_state(ClientState.menu)
+    await safe_send_message(
+        client_id,
+        f"👨‍⚖️ <b>{text}</b>\n\nНажмите 👨‍⚖️ Связаться с юристом снова",
+        reply_markup=client_main_menu(),
+        parse_mode=ParseMode.HTML
+    )
 
 async def end_chat_for_admin(admin_id: int, state: FSMContext, text: str):
     logger.info(f"🔚 Завершение диалога для админа {admin_id}: {text}")
@@ -283,7 +288,7 @@ def admin_in_chat_menu(client_name: str):
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
 
-# ============ ГОТОВЫЕ ОТВЕТЫ ============
+# ============ ГОТОВЫЕ ТЕКСТЫ ============
 BOT_ANSWERS = {
     "привет": "👋 Здравствуйте! Я помогу вам с юридическими вопросами.\n\nВыберите действие в меню ниже ⬇️",
     "здравствуйте": "👋 Добрый день! Готов помочь.\n\nВыберите действие в меню ниже ⬇️",
@@ -340,12 +345,12 @@ BANNED_MESSAGE = """
 
 # ============ ОБРАБОТЧИКИ ============
 
+# ---------- КОМАНДЫ ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     uid = message.from_user.id
     await state.clear()
     await remove_active_chat(uid)
-    await update_client_info(uid, message.from_user.full_name, message.from_user.username)
 
     if is_admin(uid):
         await state.set_state(AdminState.idle)
@@ -356,6 +361,8 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         logger.info(f"👑 Админ {uid} запустил бота")
     else:
+        # Создаём запись клиента при первом старте
+        await update_client_info(uid, message.from_user.full_name, message.from_user.username)
         await state.set_state(ClientState.menu)
         await message.answer(
             f"👑 <b>Консуллекс</b>\n\nПривет, {message.from_user.first_name}!\n\n"
@@ -369,6 +376,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def cmd_stop(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+
     uid = message.from_user.id
     client_id = None
     async with active_chats_lock:
@@ -376,6 +384,7 @@ async def cmd_stop(message: Message, state: FSMContext):
             if aid == uid:
                 client_id = cid
                 break
+
     if client_id:
         await end_chat_for_client(client_id, "Админ завершил диалог")
         await end_chat_for_admin(uid, state, "Диалог завершён")
@@ -386,10 +395,12 @@ async def cmd_stop(message: Message, state: FSMContext):
 
 @dp.message(Command("debug"), F.from_user.id == ADMIN_ID)
 async def cmd_debug(message: Message, state: FSMContext):
+    """Показывает состояние бота для отладки."""
     uid = message.from_user.id
     current_state = await state.get_state()
     chats = await get_all_active_chats()
     clients = await get_all_clients()
+
     debug_text = f"🛠 <b>Debug info</b>\n\n"
     debug_text += f"👑 Админ: {uid}\n"
     debug_text += f"📌 Текущее состояние: {current_state}\n"
@@ -399,6 +410,7 @@ async def cmd_debug(message: Message, state: FSMContext):
     debug_text += f"👥 Всего клиентов: {len(clients)}\n"
     banned = sum(1 for c in clients.values() if c.get("banned"))
     debug_text += f"🔒 Забанено: {banned}\n"
+
     await message.answer(debug_text, parse_mode=ParseMode.HTML)
 
 # ---------- КЛИЕНТ ----------
@@ -439,7 +451,7 @@ async def client_call_lawyer(message: Message, state: FSMContext):
     uid = message.from_user.id
     user = message.from_user
 
-    # 🔥 ОБЯЗАТЕЛЬНО сохраняем клиента в базу при вызове юриста
+    # Сохраняем клиента при вызове юриста
     await update_client_info(uid, user.full_name, user.username)
 
     if await is_client_banned(uid):
@@ -496,7 +508,10 @@ async def client_to_lawyer(message: Message, state: FSMContext):
     uid = message.from_user.id
     user = message.from_user
 
-    await update_client_info(uid, user.full_name, user.username)
+    # Обновляем информацию и увеличиваем счётчик сообщений
+    await update_client_info(uid, user.full_name, user.username, increment_messages=True)
+
+    # Проверка бана
     if await is_client_banned(uid):
         admin_id = await get_active_chat(uid)
         if admin_id:
@@ -514,6 +529,7 @@ async def client_to_lawyer(message: Message, state: FSMContext):
 
     logger.info(f"📤 Клиент {uid} -> Админ {admin_id}: {message.text[:50] if message.text else '[не текст]'}")
 
+    # Флаг ожидания контактов
     admin_state = get_fsm_context(admin_id)
     admin_data = await admin_state.get_data()
     waiting_contacts = admin_data.get('waiting_contacts', False)
@@ -547,6 +563,7 @@ async def client_to_lawyer(message: Message, state: FSMContext):
             await message.reply("❌ Неподдерживаемый тип сообщения")
             return
 
+        # Одно уведомление за сессию
         data = await state.get_data()
         if not data.get('notified'):
             await state.update_data(notified=True)
@@ -566,7 +583,9 @@ async def client_to_lawyer(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(ClientState.menu))
 async def client_bot_chat(message: Message, state: FSMContext):
-    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    # Сохраняем клиента и увеличиваем счётчик сообщений
+    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username, increment_messages=True)
+
     text = message.text.lower() if message.text else ""
     answer = None
     for key, resp in BOT_ANSWERS.items():
@@ -595,9 +614,10 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
     client_id = int(parts[1])
     client_name = parts[2] if len(parts) > 2 else "Клиент"
 
-    # 🔥 Сохраняем клиента в базу при первом контакте админа (если вдруг ещё не был сохранён)
+    # Сохраняем клиента, если его ещё нет
     await update_client_info(client_id, client_name, None)
 
+    # Проверка бана
     if await is_client_banned(client_id):
         await callback.answer("⛔ Клиент забанен, невозможно начать диалог.", show_alert=True)
         return
@@ -609,10 +629,11 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
         return
 
     if existing_admin == callback.from_user.id:
-        logger.info(f"🔄 Админ {callback.from_user.id} повторно нажал на кнопку клиента {client_id}, диалог уже активен. Игнорируем.")
+        logger.info(f"🔄 Админ {callback.from_user.id} повторно нажал на кнопку клиента {client_id}, диалог уже активен.")
         await callback.answer("✅ Вы уже в чате с этим клиентом.", show_alert=True)
         return
 
+    # Всё хорошо – начинаем диалог
     await state.set_state(AdminState.talking_to_client)
     await state.update_data(talking_to=client_id, client_name=client_name, waiting_contacts=False)
     await set_active_chat(client_id, callback.from_user.id)
@@ -631,28 +652,25 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
 
     await callback.answer("✅ Подключены")
 
-@dp.message(StateFilter(AdminState.talking_to_client), F.text.startswith("❌ Завершить диалог с"))
-async def admin_end_chat(message: Message, state: FSMContext):
-    data = await state.get_data()
-    client_id = data.get('talking_to')
-    client_name = data.get('client_name', 'Клиент')
-    if client_id:
-        await end_chat_for_client(client_id, "Юрист завершил консультацию")
-        await end_chat_for_admin(message.from_user.id, state, f"Диалог с {client_name} завершён")
+# ---------- ГОРЯЧИЕ КЛАВИШИ АДМИНА В ДИАЛОГЕ ----------
+# Эти хендлеры должны быть выше общего admin_to_client, чтобы перехватывать кнопки
 
 @dp.message(StateFilter(AdminState.talking_to_client), F.text == "💰 Прайс-лист")
 async def admin_send_price_list(message: Message, state: FSMContext):
+    logger.info(f"💰 Админ нажал: {message.text}")
     data = await state.get_data()
     client_id = data.get('talking_to')
     if not client_id:
         await message.answer("⚠️ Нет активного клиента")
         return
+
     if not await get_active_chat(client_id):
         await message.answer("⚠️ Клиент отключился или завершил диалог")
         await state.clear()
         await state.set_state(AdminState.idle)
         await message.answer("Вы свободны", reply_markup=admin_idle_menu())
         return
+
     sent = await safe_send_message(client_id, PRICE_LIST, parse_mode=ParseMode.HTML)
     if sent:
         await message.answer("✅ Прайс-лист отправлен клиенту")
@@ -662,17 +680,20 @@ async def admin_send_price_list(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(AdminState.talking_to_client), F.text == "📞 Запросить контакты")
 async def admin_ask_contacts(message: Message, state: FSMContext):
+    logger.info(f"📞 Админ нажал: {message.text}")
     data = await state.get_data()
     client_id = data.get('talking_to')
     if not client_id:
         await message.answer("⚠️ Нет активного клиента")
         return
+
     if not await get_active_chat(client_id):
         await message.answer("⚠️ Клиент отключился или завершил диалог")
         await state.clear()
         await state.set_state(AdminState.idle)
         await message.answer("Вы свободны", reply_markup=admin_idle_menu())
         return
+
     await state.update_data(waiting_contacts=True)
     sent = await safe_send_message(client_id, ASK_CONTACTS, parse_mode=ParseMode.HTML)
     if sent:
@@ -683,17 +704,20 @@ async def admin_ask_contacts(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(AdminState.talking_to_client), F.text == "❌ Не можем помочь")
 async def admin_cannot_help(message: Message, state: FSMContext):
+    logger.info(f"❌ Админ нажал: {message.text}")
     data = await state.get_data()
     client_id = data.get('talking_to')
     if not client_id:
         await message.answer("⚠️ Нет активного клиента")
         return
+
     if not await get_active_chat(client_id):
         await message.answer("⚠️ Клиент отключился или завершил диалог")
         await state.clear()
         await state.set_state(AdminState.idle)
         await message.answer("Вы свободны", reply_markup=admin_idle_menu())
         return
+
     sent = await safe_send_message(client_id, CANNOT_HELP, parse_mode=ParseMode.HTML)
     if sent:
         await message.answer("✅ Уведомление об отказе отправлено клиенту")
@@ -703,17 +727,93 @@ async def admin_cannot_help(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(AdminState.talking_to_client), F.text == "🔒 Заблокировать этого клиента")
 async def admin_ban_client_from_chat(message: Message, state: FSMContext):
+    logger.info(f"🔒 Админ нажал: {message.text}")
     data = await state.get_data()
     client_id = data.get('talking_to')
     client_name = data.get('client_name', 'Клиент')
     if not client_id:
         await message.answer("⚠️ Нет активного клиента")
         return
+
     await set_client_ban(client_id, True, reason="Заблокирован админом во время диалога")
     logger.info(f"⛔ Админ {message.from_user.id} заблокировал клиента {client_id}")
+
     await end_chat_for_client(client_id, "Админ заблокировал доступ к юристу")
     await end_chat_for_admin(message.from_user.id, state, f"Клиент {client_name} заблокирован и диалог завершён")
     await message.answer(f"🔒 Клиент {client_name} (ID: {client_id}) заблокирован.")
+
+@dp.message(StateFilter(AdminState.talking_to_client), F.text.startswith("❌ Завершить диалог с"))
+async def admin_end_chat(message: Message, state: FSMContext):
+    logger.info(f"❌ Админ завершает диалог: {message.text}")
+    data = await state.get_data()
+    client_id = data.get('talking_to')
+    client_name = data.get('client_name', 'Клиент')
+    if client_id:
+        await end_chat_for_client(client_id, "Юрист завершил консультацию")
+        await end_chat_for_admin(message.from_user.id, state, f"Диалог с {client_name} завершён")
+
+# ---------- ОБЩИЙ ОБРАБОТЧИК СООБЩЕНИЙ АДМИНА В ДИАЛОГЕ ----------
+@dp.message(StateFilter(AdminState.talking_to_client))
+async def admin_to_client(message: Message, state: FSMContext):
+    # Если это одна из горячих кнопок – не обрабатываем (уже перехватили выше)
+    hot_buttons = ["💰 Прайс-лист", "📞 Запросить контакты", "❌ Не можем помочь",
+                   "🔒 Заблокировать этого клиента"]
+    if message.text and message.text.startswith("❌ Завершить диалог с"):
+        return  # уже обработано
+    if message.text and message.text in hot_buttons:
+        return
+
+    data = await state.get_data()
+    client_id = data.get('talking_to')
+    if not client_id:
+        await message.answer("⚠️ Нет активного клиента")
+        await state.clear()
+        await state.set_state(AdminState.idle)
+        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
+        return
+
+    if not await get_active_chat(client_id):
+        await message.answer("⚠️ Клиент отключился или завершил диалог")
+        await state.clear()
+        await state.set_state(AdminState.idle)
+        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
+        return
+
+    # Обновляем last_seen клиента
+    await update_client_info(client_id, None, None, increment_messages=False)
+
+    header = "👨‍⚖️ <b>Иван Серко:</b>\n\n"
+    sent = False
+    try:
+        if message.text:
+            sent = await safe_send_message(client_id, header + message.text, parse_mode=ParseMode.HTML)
+        elif message.photo:
+            sent = await safe_send_photo(
+                client_id, message.photo[-1].file_id,
+                caption=header + (message.caption or ""),
+                parse_mode=ParseMode.HTML
+            )
+        elif message.document:
+            sent = await safe_send_document(
+                client_id, message.document.file_id,
+                caption=header + (message.caption or ""),
+                parse_mode=ParseMode.HTML
+            )
+        elif message.voice:
+            await safe_send_message(client_id, header, parse_mode=ParseMode.HTML)
+            sent = await safe_send_voice(client_id, message.voice.file_id, parse_mode=ParseMode.HTML)
+        else:
+            await message.answer("❌ Неподдерживаемый тип")
+            return
+
+        if sent:
+            await message.answer("✅ Отправлено")
+            logger.info(f"📤 Админ -> Клиент {client_id}: {message.text[:50] if message.text else '[не текст]'}")
+        else:
+            await message.answer("⚠️ Ошибка отправки (возможно, клиент недоступен)")
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки админом: {e}")
+        await message.answer("❌ Ошибка отправки")
 
 # ---------- УПРАВЛЕНИЕ КЛИЕНТАМИ ----------
 @dp.message(StateFilter(AdminState.idle), F.text == "👥 Управление клиентами")
@@ -742,6 +842,7 @@ async def admin_list_clients(message: Message, state: FSMContext):
     if not clients:
         await message.answer("📭 Нет ни одного клиента.")
         return
+
     lines = ["📋 <b>Все клиенты:</b>\n"]
     for uid, info in clients.items():
         banned = "🔒" if info.get("banned") else "✅"
@@ -753,6 +854,7 @@ async def admin_list_clients(message: Message, state: FSMContext):
         if len(lines) > 30:
             lines.append("... и ещё несколько")
             break
+
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 @dp.message(StateFilter(AdminState.managing_clients), F.text == "🔒 Заблокировать")
@@ -780,36 +882,45 @@ async def admin_remind_client_request(message: Message, state: FSMContext):
 async def admin_process_client_id(message: Message, state: FSMContext):
     if not message.text or message.text.startswith('/'):
         return
+
     data = await state.get_data()
     ban_action = data.get('ban_action')
     reminder_action = data.get('reminder_action')
+
     try:
         client_id = int(message.text.strip())
     except ValueError:
         await message.answer("❌ Некорректный ID. Введите число.")
         return
+
     client_info = await get_client_info(client_id)
     if not client_info:
         await message.answer(f"❌ Клиент с ID <code>{client_id}</code> не найден в базе.", parse_mode=ParseMode.HTML)
         await state.set_state(AdminState.managing_clients)
         await state.update_data(ban_action=None, reminder_action=False)
         return
+
     if ban_action:
         if ban_action == "ban":
             await set_client_ban(client_id, True, reason="Заблокирован админом через меню")
             await message.answer(f"🔒 Клиент <code>{client_id}</code> заблокирован.", parse_mode=ParseMode.HTML)
             logger.info(f"⛔ Админ {message.from_user.id} заблокировал клиента {client_id}")
+
+            # Если клиент в активном чате – завершаем диалог
             admin_in_chat = await get_active_chat(client_id)
             if admin_in_chat:
                 admin_state = get_fsm_context(admin_in_chat)
                 await end_chat_for_admin(admin_in_chat, admin_state, "Клиент заблокирован")
                 await end_chat_for_client(client_id, "Доступ к юристу заблокирован")
+
         elif ban_action == "unban":
             await set_client_ban(client_id, False)
             await message.answer(f"🔓 Клиент <code>{client_id}</code> разблокирован.", parse_mode=ParseMode.HTML)
             logger.info(f"✅ Админ {message.from_user.id} разблокировал клиента {client_id}")
+
         await state.set_state(AdminState.managing_clients)
         await state.update_data(ban_action=None, reminder_action=False)
+
     elif reminder_action:
         await state.set_state(AdminState.waiting_reminder_text)
         await state.update_data(reminder_target=client_id, reminder_action=False)
@@ -819,15 +930,18 @@ async def admin_process_client_id(message: Message, state: FSMContext):
 async def admin_send_reminder_text(message: Message, state: FSMContext):
     if not message.text or message.text.startswith('/'):
         return
+
     data = await state.get_data()
     client_id = data.get('reminder_target')
     if not client_id:
         await state.set_state(AdminState.managing_clients)
         return
+
     reminder_text = message.text.strip()
     if not reminder_text:
         await message.answer("❌ Текст не может быть пустым.")
         return
+
     sent = await safe_send_message(
         client_id,
         f"📌 <b>Напоминание от администратора:</b>\n\n{reminder_text}",
@@ -838,6 +952,7 @@ async def admin_send_reminder_text(message: Message, state: FSMContext):
         logger.info(f"📨 Админ отправил напоминание клиенту {client_id}")
     else:
         await message.answer(f"❌ Не удалось отправить напоминание клиенту <code>{client_id}</code>.", parse_mode=ParseMode.HTML)
+
     await state.set_state(AdminState.managing_clients)
     await state.update_data(reminder_target=None)
 
@@ -846,76 +961,24 @@ async def admin_send_reminder_text(message: Message, state: FSMContext):
 async def admin_stats(message: Message, state: FSMContext):
     chats = await get_all_active_chats()
     count = len(chats)
-    clients = list(chats.keys())
+    clients_list = list(chats.keys())
     total_clients = len(await get_all_clients())
     banned_clients = 0
     async with clients_db_lock:
         for info in clients_db.values():
             if info.get("banned"):
                 banned_clients += 1
+
     await message.answer(
         f"📊 <b>Статистика</b>\n\n"
         f"👥 Всего клиентов: {total_clients}\n"
         f"🔒 Заблокировано: {banned_clients}\n"
         f"💬 Активных диалогов: {count}\n"
-        f"🆔 Активные клиенты: {clients if clients else 'нет'}",
+        f"🆔 Активные клиенты: {clients_list if clients_list else 'нет'}",
         parse_mode=ParseMode.HTML
     )
 
-# ---------- Обработка обычных сообщений админа в чате ----------
-@dp.message(StateFilter(AdminState.talking_to_client))
-async def admin_to_client(message: Message, state: FSMContext):
-    data = await state.get_data()
-    client_id = data.get('talking_to')
-    if not client_id:
-        await message.answer("⚠️ Нет активного клиента")
-        await state.clear()
-        await state.set_state(AdminState.idle)
-        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
-        return
-    if not await get_active_chat(client_id):
-        await message.answer("⚠️ Клиент отключился или завершил диалог")
-        await state.clear()
-        await state.set_state(AdminState.idle)
-        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
-        return
-
-    # 🔥 Обновляем last_seen клиента при отправке сообщения админом
-    await update_client_info(client_id, None, None)
-
-    header = "👨‍⚖️ <b>Иван Серко:</b>\n\n"
-    sent = False
-    try:
-        if message.text:
-            sent = await safe_send_message(client_id, header + message.text, parse_mode=ParseMode.HTML)
-        elif message.photo:
-            sent = await safe_send_photo(
-                client_id, message.photo[-1].file_id,
-                caption=header + (message.caption or ""),
-                parse_mode=ParseMode.HTML
-            )
-        elif message.document:
-            sent = await safe_send_document(
-                client_id, message.document.file_id,
-                caption=header + (message.caption or ""),
-                parse_mode=ParseMode.HTML
-            )
-        elif message.voice:
-            await safe_send_message(client_id, header, parse_mode=ParseMode.HTML)
-            sent = await safe_send_voice(client_id, message.voice.file_id, parse_mode=ParseMode.HTML)
-        else:
-            await message.answer("❌ Неподдерживаемый тип")
-            return
-        if sent:
-            await message.answer("✅ Отправлено")
-            logger.info(f"📤 Админ -> Клиент {client_id}: {message.text[:50] if message.text else '[не текст]'}")
-        else:
-            await message.answer("⚠️ Ошибка отправки (возможно, клиент недоступен)")
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки админом: {e}")
-        await message.answer("❌ Ошибка отправки")
-
-# ---------- Обработчик для свободного админа ----------
+# ---------- ОБРАБОТЧИК ДЛЯ СВОБОДНОГО АДМИНА ----------
 @dp.message(StateFilter(AdminState.idle))
 async def admin_idle(message: Message, state: FSMContext):
     if message.text and message.text.startswith('/'):
@@ -970,12 +1033,14 @@ async def stop_worker(app):
 # ============ MAIN ============
 async def main():
     port = int(os.getenv("PORT", "10000"))
+
     app = web.Application()
     app.on_startup.append(start_worker)
     app.on_shutdown.append(stop_worker)
     app.router.add_get("/", root)
     app.router.add_get("/health", health)
     app.router.add_post("/webhook", handle_webhook)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
