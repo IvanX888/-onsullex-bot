@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -379,7 +378,7 @@ async def handle_webhook(request: web.Request):
         data = await request.json()
         logger.info(f"📩 Получен webhook: {data.get('update_id', 'unknown')}")
         
-        # Используем feed_raw_update - принимает словарь
+        # Используем feed_raw_update
         result = await dp.feed_raw_update(bot, data)
         
         return web.Response(text="OK", status=200)
@@ -394,39 +393,45 @@ async def health(request: web.Request):
 async def root(request: web.Request):
     return web.Response(text=f"Bot OK. Admin: {ADMIN_ID}")
 
-# ============ ГЛАВНАЯ ФУНКЦИЯ ============
-
-async def main():
-    """Главная функция - запускает сервер и устанавливает webhook"""
-    port = int(os.getenv("PORT", "10000"))
-    
-    # Создаём приложение
-    app = web.Application()
-    app.router.add_get("/", root)
-    app.router.add_get("/health", health)
-    app.router.add_post("/webhook", handle_webhook)
-    
-    # Запускаем сервер в фоне (чтобы Render увидел порт сразу)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    
-    logger.info(f"🚀 Запуск сервера на порту {port}...")
-    await site.start()
-    logger.info(f"✅ Сервер запущен на порту {port}")
-    
-    # Теперь устанавливаем webhook (после запуска сервера)
+async def on_startup(app: web.Application):
+    """Устанавливаем webhook при старте"""
     webhook_url = f"{WEBHOOK_URL}/webhook"
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_webhook(webhook_url)
         logger.info(f"✅ Webhook установлен: {webhook_url}")
     except Exception as e:
-        logger.error(f"❌ Ошибка webhook: {e}")
+        logger.error(f"❌ Webhook error: {e}")
+
+async def on_shutdown(app: web.Application):
+    try:
+        await bot.delete_webhook()
+        await bot.session.close()
+    except Exception as e:
+        logger.error(f"❌ Shutdown error: {e}")
+
+# ============ ЗАПУСК ============
+
+def main():
+    port = int(os.getenv("PORT", "10000"))
     
-    # Держим программу живой
-    while True:
-        await asyncio.sleep(3600)  # Спим час
+    app = web.Application()
+    app.router.add_get("/", root)
+    app.router.add_get("/health", health)
+    app.router.add_post("/webhook", handle_webhook)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    logger.info(f"🚀 Запуск сервера на порту {port}...")
+    
+    # Запускаем сервер (блокирует поток, но это нормально)
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=port,
+        access_log=logger,
+        print=None
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
