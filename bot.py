@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -42,7 +42,7 @@ dp = Dispatcher(storage=storage)
 
 # Хранилище: user_id -> количество сообщений
 user_stats = {}
-# Хранилище активных диалогов с оператором
+# Хранилище активных диалогов: client_id -> admin_id (кто с кем общается)
 active_dialogs = {}
 
 # ============ КЛАВИАТУРЫ ============
@@ -109,11 +109,16 @@ async def cmd_start(message: Message, state: FSMContext):
     uid = message.from_user.id
     logger.info(f"🚀 /start от {uid}")
     
+    # Очищаем состояние и устанавливаем режим бота
     await state.clear()
     await state.set_state(ChatState.bot_chat)
     
     # Сбрасываем счётчик
     user_stats[uid] = 0
+    
+    # Удаляем из активных диалогов если был
+    if uid in active_dialogs:
+        del active_dialogs[uid]
     
     welcome = f"""
 👑 <b>Добро пожаловать в Консуллекс!</b>
@@ -140,31 +145,55 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.message(Command("stop"))
 async def cmd_stop(message: Message, state: FSMContext):
     """Админская команда для сброса любого состояния"""
-    if not is_admin(message.from_user.id):
-        return
-    
     uid = message.from_user.id
     
-    # Если админ в диалоге с клиентом
-    if uid in active_dialogs:
-        client_id = active_dialogs[uid]
-        try:
-            await bot.send_message(client_id, "👨‍⚖️ Юрист завершил консультацию. Если есть вопросы — обращайтесь!", reply_markup=main_menu())
-            await state.clear()
-            await state.set_state(ChatState.bot_chat)
-            del active_dialogs[uid]
-            await message.answer(f"✅ Диалог с клиентом {client_id} завершён", reply_markup=main_menu())
-        except Exception as e:
-            await message.answer(f"❌ Ошибка: {e}")
+    if not is_admin(uid):
         return
     
-    await state.clear()
-    await state.set_state(ChatState.bot_chat)
-    await message.answer("✅ Состояние сброшено", reply_markup=main_menu())
+    # Ищем клиента, с которым общается админ
+    client_id = None
+    for cid, aid in list(active_dialogs.items()):
+        if aid == uid:
+            client_id = cid
+            break
+    
+    if client_id:
+        try:
+            # Сбрасываем состояние клиента и возвращаем к боту
+            client_state = dp.fsm.get_context(bot, client_id, client_id)
+            await client_state.clear()
+            await client_state.set_state(ChatState.bot_chat)
+            
+            await bot.send_message(
+                client_id, 
+                "👨‍⚖️ Юрист завершил консультацию. Если есть вопросы — обращайтесь!", 
+                reply_markup=main_menu()
+            )
+            
+            del active_dialogs[client_id]
+            await state.clear()
+            await state.set_state(ChatState.bot_chat)
+            
+            await message.answer(f"✅ Диалог с клиентом {client_id} завершён", reply_markup=main_menu())
+            logger.info(f"✅ /stop: Диалог с {client_id} завершён")
+        except Exception as e:
+            logger.error(f"❌ Ошибка в /stop: {e}")
+            await message.answer(f"❌ Ошибка: {e}")
+    else:
+        # Просто сброс своего состояния
+        await state.clear()
+        await state.set_state(ChatState.bot_chat)
+        await message.answer("✅ Состояние сброшено. Нет активных диалогов.", reply_markup=main_menu())
 
 # ============ МЕНЮ ============
 @dp.message(F.text == "📝 Оставить заявку")
-async def menu_request(message: Message):
+async def menu_request(message: Message, state: FSMContext):
+    # Проверяем, не в режиме оператора ли клиент
+    current_state = await state.get_state()
+    if current_state == ChatState.operator_chat.state and not is_admin(message.from_user.id):
+        await message.answer("⚠️ Вы на связи с юристом. Дождитесь ответа или нажмите ❌ Завершить диалог.")
+        return
+    
     await message.answer(
         "📞 <b>Оставить заявку:</b>\n\n"
         "📱 WhatsApp/Telegram: +7 (977) 42-32-473\n"
@@ -173,7 +202,11 @@ async def menu_request(message: Message):
     )
 
 @dp.message(F.text == "⚖️ Услуги")
-async def menu_services(message: Message):
+async def menu_services(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == ChatState.operator_chat.state and not is_admin(message.from_user.id):
+        return
+    
     await message.answer(
         "⚖️ <b>Наши услуги:</b>\n\n"
         "🏛️ <b>Недвижимость</b>\n"
@@ -196,7 +229,11 @@ async def menu_services(message: Message):
     )
 
 @dp.message(F.text == "💰 Цены")
-async def menu_prices(message: Message):
+async def menu_prices(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == ChatState.operator_chat.state and not is_admin(message.from_user.id):
+        return
+    
     await message.answer(
         "💰 <b>Стоимость услуг:</b>\n\n"
         "📝 <b>Консультация</b> — от 3 000 ₽\n"
@@ -207,7 +244,11 @@ async def menu_prices(message: Message):
     )
 
 @dp.message(F.text == "📞 Контакты")
-async def menu_contacts(message: Message):
+async def menu_contacts(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == ChatState.operator_chat.state and not is_admin(message.from_user.id):
+        return
+    
     await message.answer(
         "📞 <b>Контакты:</b>\n\n"
         "📱 Телефон/WhatsApp: +7 (977) 42-32-473\n"
@@ -217,7 +258,11 @@ async def menu_contacts(message: Message):
     )
 
 @dp.message(F.text == "❓ Задать вопрос")
-async def menu_faq(message: Message):
+async def menu_faq(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == ChatState.operator_chat.state and not is_admin(message.from_user.id):
+        return
+    
     await message.answer(
         "❓ <b>Задайте вопрос!</b>\n\n"
         "Я отвечу на типовые вопросы. Если нужна конкретная помощь — нажмите 👨‍⚖️ Связаться с юристом\n\n"
@@ -226,6 +271,10 @@ async def menu_faq(message: Message):
         "• Какие услуги вы оказываете?\n"
         "• Как с вами связаться?"
     )
+
+@dp.message(F.text == "❓ FAQ")
+async def menu_faq_btn(message: Message, state: FSMContext):
+    await menu_faq(message, state)
 
 # ============ ПЕРЕКЛЮЧЕНИЕ НА ОПЕРАТОРА ============
 @dp.message(F.text == "👨‍⚖️ Связаться с юристом")
@@ -246,6 +295,7 @@ async def call_operator(message: Message, state: FSMContext):
     
     logger.info(f"👨‍⚖️ Клиент {uid} переключился на оператора")
     
+    # Устанавливаем состояние оператора
     await state.set_state(ChatState.operator_chat)
     
     await message.answer(
@@ -262,7 +312,7 @@ async def call_operator(message: Message, state: FSMContext):
     # Уведомление админу
     user = message.from_user
     try:
-        msg = await bot.send_message(
+        await bot.send_message(
             ADMIN_ID,
             f"🔔 <b>Новый клиент на связи!</b>\n\n"
             f"👤 Имя: {user.full_name}\n"
@@ -276,24 +326,24 @@ async def call_operator(message: Message, state: FSMContext):
             parse_mode=ParseMode.HTML
         )
         
-        # Сохраняем связь: admin_msg_id -> client_id
-        active_dialogs[ADMIN_ID] = uid
+        # Сохраняем связь: client_id -> admin_id
+        active_dialogs[uid] = ADMIN_ID
         
-        logger.info(f"✅ Админ уведомлён о клиенте {uid}")
+        logger.info(f"✅ Админ уведомлён о клиенте {uid}, диалог добавлен в active_dialogs")
     except Exception as e:
-        logger.error(f"❌ Ошибка уведомления: {e}")
+        logger.error(f"❌ Ошибка уведомления админа: {e}")
         await message.answer("⚠️ Ошибка связи. Позвоните: +7 (977) 42-32-473")
 
 @dp.message(F.text == "📞 Телефон для связи")
-async def operator_phone(message: Message):
+async def operator_phone(message: Message, state: FSMContext):
     await message.answer("📞 +7 (977) 42-32-473 (WhatsApp/Telegram)")
 
 # ============ ОБЩЕНИЕ С БОТОМ (АВТООТВЕТЫ) ============
-@dp.message(ChatState.bot_chat)
+@dp.message(StateFilter(ChatState.bot_chat))
 async def bot_chat_handler(message: Message, state: FSMContext):
     """Обработка сообщений в режиме бота"""
     uid = message.from_user.id
-    text = message.text.lower()
+    text = message.text.lower() if message.text else ""
     
     # Увеличиваем счётчик сообщений
     user_stats[uid] = user_stats.get(uid, 0) + 1
@@ -322,7 +372,7 @@ async def bot_chat_handler(message: Message, state: FSMContext):
     await message.answer(answer, reply_markup=bot_chat_menu())
 
 # ============ ОБЩЕНИЕ С ОПЕРАТОРОМ ============
-@dp.message(ChatState.operator_chat)
+@dp.message(StateFilter(ChatState.operator_chat))
 async def operator_chat_handler(message: Message, state: FSMContext):
     """Обработка сообщений в режиме оператора"""
     uid = message.from_user.id
@@ -405,8 +455,18 @@ async def admin_reply_callback(callback: types.CallbackQuery, state: FSMContext)
     
     uid = int(callback.data.split(":")[1])
     
+    # Проверяем, не занят ли клиент другим админом (если админов несколько)
+    if uid in active_dialogs and active_dialogs[uid] != callback.from_user.id:
+        await callback.answer("⚠️ Этот клиент уже общается с другим оператором", show_alert=True)
+        return
+    
     # Сохраняем ID клиента для ответа
     await state.update_data(reply_to=uid)
+    # Устанавливаем состояние бота для админа (чтобы не мешать)
+    await state.set_state(ChatState.bot_chat)
+    
+    # Добавляем в активные диалогы
+    active_dialogs[uid] = callback.from_user.id
     
     await callback.message.answer(
         f"✍️ <b>Режим ответа клиенту</b>\n\n"
@@ -416,22 +476,37 @@ async def admin_reply_callback(callback: types.CallbackQuery, state: FSMContext)
         f"Для выхода нажмите ❌ Завершить диалог с клиентом",
         reply_markup=admin_menu()
     )
-    await callback.answer()
+    await callback.answer("✅ Режим ответа активирован")
 
+# ============ АДМИН: ЗАВЕРШЕНИЕ ДИАЛОГА ============
 @dp.message(F.text == "❌ Завершить диалог с клиентом")
 async def admin_end_dialog(message: Message, state: FSMContext):
     """Админ завершает диалог с клиентом"""
-    if not is_admin(message.from_user.id):
+    uid = message.from_user.id
+    
+    if not is_admin(uid):
         return
     
     data = await state.get_data()
     client_id = data.get('reply_to')
     
+    # Если нет в состоянии, ищем в active_dialogs
     if not client_id:
-        await message.answer("❌ Нет активного диалога для завершения")
+        for cid, aid in active_dialogs.items():
+            if aid == uid:
+                client_id = cid
+                break
+    
+    if not client_id:
+        await message.answer("❌ Нет активного диалога для завершения", reply_markup=main_menu())
         return
     
     try:
+        # Очищаем состояние клиента и возвращаем к боту
+        client_state = dp.fsm.get_context(bot, client_id, client_id)
+        await client_state.clear()
+        await client_state.set_state(ChatState.bot_chat)
+        
         # Отправляем клиенту уведомление
         await bot.send_message(
             client_id,
@@ -442,8 +517,13 @@ async def admin_end_dialog(message: Message, state: FSMContext):
         )
         
         # Удаляем из активных диалогов
-        if message.from_user.id in active_dialogs:
-            del active_dialogs[message.from_user.id]
+        if client_id in active_dialogs:
+            del active_dialogs[client_id]
+        
+        # Очищаем состояние админа
+        await state.clear()
+        await state.set_state(ChatState.bot_chat)
+        await state.update_data(reply_to=None)
         
         await message.answer(
             f"✅ Диалог с клиентом {client_id} завершён.\n"
@@ -454,7 +534,7 @@ async def admin_end_dialog(message: Message, state: FSMContext):
         logger.info(f"✅ Админ завершил диалог с {client_id}")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка завершения: {e}")
+        logger.error(f"❌ Ошибка завершения диалога: {e}")
         await message.answer(f"❌ Ошибка: {e}")
 
 @dp.message(F.text == "📊 Статистика")
@@ -467,17 +547,14 @@ async def admin_stats(message: Message):
     await message.answer(
         f"📊 <b>Статистика:</b>\n\n"
         f"🟢 Активных диалогов: {active_count}\n"
-        f"👥 Всего уникальных пользователей: {len(user_stats)}"
+        f"👥 Всего уникальных пользователей: {len(user_stats)}\n\n"
+        f"Активные диалоги: {list(active_dialogs.keys())}"
     )
 
-# ============ АДМИН: ОТПРАВКА СООБЩЕНИЯ ============
-@dp.message()
+# ============ АДМИН: ОТПРАВКА СООБЩЕНИЯ КЛИЕНТУ ============
+@dp.message(StateFilter(ChatState.bot_chat), F.from_user.id == ADMIN_ID)
 async def admin_send_message(message: Message, state: FSMContext):
-    """Обработка сообщений админа (ответы клиентам)"""
-    # Если не админ — игнорируем (уже обработано выше)
-    if not is_admin(message.from_user.id):
-        return
-    
+    """Обработка сообщений админа (ответы клиентам) - только когда reply_to установлен"""
     data = await state.get_data()
     client_id = data.get('reply_to')
     
@@ -487,6 +564,12 @@ async def admin_send_message(message: Message, state: FSMContext):
         if message.text and message.text.startswith('/'):
             return  # Пусть обработчики команд сами разбираются
         
+        # Игнорируем кнопки меню
+        if message.text in ["📝 Оставить заявку", "👨‍⚖️ Связаться с юристом", "⚖️ Услуги", 
+                           "💰 Цены", "📞 Контакты", "❓ Задать вопрос", "📊 Статистика",
+                           "❌ Завершить диалог с клиентом"]:
+            return
+        
         await message.answer(
             "ℹ️ Нет активного диалога.\n\n"
             "Чтобы ответить клиенту:\n"
@@ -494,6 +577,12 @@ async def admin_send_message(message: Message, state: FSMContext):
             "2. Нажмите кнопку «✍️ Ответить» под его сообщением\n"
             "3. Или используйте /stop для сброса"
         )
+        return
+    
+    # Проверяем, что клиент всё ещё в активных диалогах
+    if client_id not in active_dialogs:
+        await message.answer(f"⚠️ Диалог с клиентом {client_id} уже завершён. Нажмите /stop")
+        await state.update_data(reply_to=None)
         return
     
     # Отправляем клиенту
@@ -534,6 +623,26 @@ async def admin_send_message(message: Message, state: FSMContext):
         logger.error(f"❌ Ошибка отправки: {e}")
         await message.answer(f"❌ Ошибка: {e}\n\nВозможно, клиент заблокировал бота.")
 
+# ============ ОБРАБОТКА ОСТАЛЬНЫХ СООБЩЕНИЙ ============
+@dp.message()
+async def unknown_message(message: Message, state: FSMContext):
+    """Обработка неизвестных сообщений"""
+    uid = message.from_user.id
+    
+    # Для клиентов без состояния - устанавливаем состояние бота
+    if not is_admin(uid):
+        current_state = await state.get_state()
+        if not current_state:
+            await state.set_state(ChatState.bot_chat)
+            await bot_chat_handler(message, state)
+            return
+    
+    # Для админа без состояния
+    if is_admin(uid):
+        current_state = await state.get_state()
+        if not current_state:
+            await state.set_state(ChatState.bot_chat)
+
 # ============ WEBHOOK ============
 async def handle_webhook(request: web.Request):
     try:
@@ -543,21 +652,28 @@ async def handle_webhook(request: web.Request):
         return web.Response(text="OK")
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}")
-        return web.Response(status=500)
+        return web.Response(status=200)  # Всегда возвращаем 200, чтобы Telegram не блокировал
 
 async def on_startup(app: web.Application = None):
     webhook_url = f"{WEBHOOK_URL}/webhook"
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(webhook_url)
-    logger.info(f"✅ Webhook: {webhook_url}")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(webhook_url)
+        logger.info(f"✅ Webhook установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка установки webhook: {e}")
 
 async def on_shutdown(app: web.Application = None):
-    await bot.delete_webhook()
-    await bot.session.close()
+    try:
+        await bot.delete_webhook()
+        await bot.session.close()
+    except Exception as e:
+        logger.error(f"❌ Ошибка при shutdown: {e}")
 
 app = web.Application()
 app.router.add_post("/webhook", handle_webhook)
 app.router.add_get("/", lambda r: web.Response(text=f"Bot OK. ADMIN: {ADMIN_ID}"))
+app.router.add_get("/health", lambda r: web.Response(text="OK"))  # Health check для Render
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
