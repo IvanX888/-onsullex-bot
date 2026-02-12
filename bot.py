@@ -1,9 +1,11 @@
 import os
 import sys
 import signal
+import sqlite3
 import logging
 import asyncio
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
@@ -36,22 +38,137 @@ if not BOT_TOKEN:
 
 logger.info(f"🔧 ADMIN_ID: {ADMIN_ID}")
 
-# ============ FSM СОСТОЯНИЯ ============
-class ClientState(StatesGroup):
-    menu = State()
-    talking_to_lawyer = State()
+# ============ SQLite БАЗА ДАННЫХ ============
+DB_PATH = "clients.db"
 
-class AdminState(StatesGroup):
-    idle = State()
-    talking_to_client = State()
-    managing_clients = State()
-    waiting_client_id = State()
-    waiting_reminder_text = State()
+def init_db():
+    """Создаёт таблицы, если их нет."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                username TEXT,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                banned INTEGER DEFAULT 0,
+                ban_reason TEXT,
+                total_messages INTEGER DEFAULT 0,
+                chats_count INTEGER DEFAULT 0
+            )
+        """)
+        # Индекс для быстрого поиска по banned
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_banned ON clients(banned)")
 
-# ============ ИНИЦИАЛИЗАЦИЯ ============
-storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=storage)
+init_db()
+
+@contextmanager
+def db_cursor():
+    """Контекстный менеджер для работы с БД."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn.cursor()
+        conn.commit()
+    finally:
+        conn.close()
+
+async def update_client_info(user_id: int, name: str = None, username: str = None, increment_messages: bool = False):
+    """Создаёт или обновляет запись о клиенте в БД."""
+    if user_id == ADMIN_ID:
+        return
+    now = datetime.now().isoformat()
+    with db_cursor() as cur:
+        # Проверяем, существует ли запись
+        cur.execute("SELECT user_id FROM clients WHERE user_id = ?", (user_id,))
+        exists = cur.fetchone()
+        if not exists:
+            cur.execute("""
+                INSERT INTO clients (user_id, name, username, first_seen, last_seen, banned, total_messages)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+            """, (user_id, name or f"User{user_id}", username, now, now, 1 if increment_messages else 0))
+            logger.info(f"🆕 Создана запись клиента {user_id} ({name})")
+        else:
+            # Обновляем last_seen, имя, username
+            update_fields = ["last_seen = ?"]
+            params = [now]
+            if name:
+                update_fields.append("name = ?")
+                params.append(name)
+            if username is not None:
+                update_fields.append("username = ?")
+                params.append(username)
+            if increment_messages:
+                update_fields.append("total_messages = total_messages + 1")
+            params.append(user_id)
+            cur.execute(f"""
+                UPDATE clients
+                SET {', '.join(update_fields)}
+                WHERE user_id = ?
+            """, params)
+
+async def is_client_banned(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return False
+    with db_cursor() as cur:
+        cur.execute("SELECT banned FROM clients WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return bool(row and row["banned"])
+
+async def set_client_ban(user_id: int, ban: bool, reason: str = None):
+    with db_cursor() as cur:
+        cur.execute("""
+            INSERT INTO clients (user_id, name, username, first_seen, last_seen, banned, ban_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                banned = excluded.banned,
+                ban_reason = excluded.ban_reason,
+                last_seen = excluded.last_seen
+        """, (
+            user_id,
+            f"User{user_id}",
+            None,
+            datetime.now().isoformat(),
+            datetime.now().isoformat(),
+            1 if ban else 0,
+            reason
+        ))
+
+async def get_all_clients():
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT user_id, name, username, last_seen, banned
+            FROM clients
+            ORDER BY last_seen DESC
+        """)
+        rows = cur.fetchall()
+        return {row["user_id"]: dict(row) for row in rows}
+
+async def get_client_info(user_id: int):
+    with db_cursor() as cur:
+        cur.execute("SELECT * FROM clients WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+async def clean_old_clients():
+    """Удаляет клиентов, неактивных более 30 дней и не в активных чатах."""
+    while True:
+        await asyncio.sleep(86400)  # раз в сутки
+        cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+        active = await get_all_active_chats()
+        placeholders = ','.join('?' * len(active)) if active else 'NULL'
+        with db_cursor() as cur:
+            # Удаляем клиентов, у которых last_seen < cutoff и не в active
+            if active:
+                cur.execute(f"""
+                    DELETE FROM clients
+                    WHERE last_seen < ? AND user_id NOT IN ({placeholders})
+                """, (cutoff, *active))
+            else:
+                cur.execute("DELETE FROM clients WHERE last_seen < ?", (cutoff,))
+            deleted = cur.rowcount
+            if deleted:
+                logger.info(f"🧹 Удалено {deleted} неактивных клиентов")
 
 # ---------- АКТИВНЫЕ ЧАТЫ ----------
 active_chats = {}
@@ -76,87 +193,22 @@ async def get_all_active_chats():
     async with active_chats_lock:
         return active_chats.copy()
 
-# ---------- БАЗА КЛИЕНТОВ ----------
-clients_db = {}
-clients_db_lock = asyncio.Lock()
+# ============ FSM СОСТОЯНИЯ ============
+class ClientState(StatesGroup):
+    menu = State()
+    talking_to_lawyer = State()
 
-async def update_client_info(user_id: int, name: str = None, username: str = None, increment_messages: bool = False):
-    if user_id == ADMIN_ID:
-        return
-    async with clients_db_lock:
-        now = datetime.now().isoformat()
-        if user_id not in clients_db:
-            clients_db[user_id] = {
-                "id": user_id,
-                "name": name or f"User{user_id}",
-                "username": username,
-                "first_seen": now,
-                "last_seen": now,
-                "banned": False,
-                "ban_reason": None,
-                "total_messages": 0,
-                "chats_count": 0
-            }
-            logger.info(f"🆕 Создана запись клиента {user_id} ({name})")
-        else:
-            clients_db[user_id]["last_seen"] = now
-            if name:
-                clients_db[user_id]["name"] = name
-            if username is not None:
-                clients_db[user_id]["username"] = username
-        if increment_messages:
-            clients_db[user_id]["total_messages"] += 1
+class AdminState(StatesGroup):
+    idle = State()
+    talking_to_client = State()
+    managing_clients = State()
+    waiting_client_id = State()
+    waiting_reminder_text = State()
 
-async def is_client_banned(user_id: int) -> bool:
-    if user_id == ADMIN_ID:
-        return False
-    async with clients_db_lock:
-        return clients_db.get(user_id, {}).get("banned", False)
-
-async def set_client_ban(user_id: int, ban: bool, reason: str = None):
-    async with clients_db_lock:
-        if user_id in clients_db:
-            clients_db[user_id]["banned"] = ban
-            clients_db[user_id]["ban_reason"] = reason
-        else:
-            clients_db[user_id] = {
-                "id": user_id,
-                "name": f"User{user_id}",
-                "username": None,
-                "first_seen": datetime.now().isoformat(),
-                "last_seen": datetime.now().isoformat(),
-                "banned": ban,
-                "ban_reason": reason,
-                "total_messages": 0,
-                "chats_count": 0
-            }
-
-async def get_all_clients():
-    async with clients_db_lock:
-        return dict(clients_db)
-
-async def get_client_info(user_id: int):
-    async with clients_db_lock:
-        return clients_db.get(user_id)
-
-# ---------- ПЕРИОДИЧЕСКАЯ ОЧИСТКА НЕАКТИВНЫХ КЛИЕНТОВ ----------
-async def clean_old_clients():
-    while True:
-        await asyncio.sleep(86400)  # раз в сутки
-        cutoff = datetime.now() - timedelta(days=30)
-        active = await get_all_active_chats()
-        async with clients_db_lock:
-            to_delete = []
-            for uid, info in clients_db.items():
-                if uid in active:
-                    continue
-                last_seen = datetime.fromisoformat(info["last_seen"])
-                if last_seen < cutoff:
-                    to_delete.append(uid)
-            for uid in to_delete:
-                del clients_db[uid]
-            if to_delete:
-                logger.info(f"🧹 Удалено {len(to_delete)} неактивных клиентов")
+# ============ ИНИЦИАЛИЗАЦИЯ ============
+storage = MemoryStorage()
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=storage)
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def get_fsm_context(user_id: int, chat_id: int = None) -> FSMContext:
@@ -835,10 +887,10 @@ async def admin_stats_in_chat(message: Message, state: FSMContext):
     clients_list = list(chats.keys())
     total_clients = len(await get_all_clients())
     banned_clients = 0
-    async with clients_db_lock:
-        for info in clients_db.values():
-            if info.get("banned"):
-                banned_clients += 1
+    with db_cursor() as cur:
+        cur.execute("SELECT COUNT(*) as cnt FROM clients WHERE banned = 1")
+        row = cur.fetchone()
+        banned_clients = row["cnt"] if row else 0
 
     await message.answer(
         f"📊 <b>Статистика</b>\n\n"
@@ -883,6 +935,7 @@ async def admin_to_client(message: Message, state: FSMContext):
         await message.answer("Вы свободны", reply_markup=admin_idle_menu())
         return
 
+    # Обновляем last_seen клиента
     await update_client_info(client_id, None, None, increment_messages=False)
 
     header = "👨‍⚖️ <b>Иван Серко:</b>\n\n"
@@ -922,16 +975,16 @@ async def admin_to_client(message: Message, state: FSMContext):
 # 6. АДМИН: КНОПКИ В СОСТОЯНИИ IDLE (приоритет выше заглушки)
 # ------------------------------------------------------------
 @dp.message(F.from_user.id == ADMIN_ID, F.text == "📊 Статистика", StateFilter(AdminState.idle))
-async def admin_stats(message: Message, state: FSMContext):
+async def admin_stats_idle(message: Message, state: FSMContext):
     chats = await get_all_active_chats()
     count = len(chats)
     clients_list = list(chats.keys())
     total_clients = len(await get_all_clients())
     banned_clients = 0
-    async with clients_db_lock:
-        for info in clients_db.values():
-            if info.get("banned"):
-                banned_clients += 1
+    with db_cursor() as cur:
+        cur.execute("SELECT COUNT(*) as cnt FROM clients WHERE banned = 1")
+        row = cur.fetchone()
+        banned_clients = row["cnt"] if row else 0
 
     await message.answer(
         f"📊 <b>Статистика</b>\n\n"
@@ -1100,11 +1153,6 @@ async def admin_idle(message: Message, state: FSMContext):
     if message.text and message.text.startswith('/'):
         return
     await message.answer("ℹ️ Вы свободны. Ждите клиента или нажмите /start", reply_markup=admin_idle_menu())
-
-# ------------------------------------------------------------
-# 9. ОБРАБОТЧИК ДЛЯ ВСЕГО ОСТАЛЬНОГО (например, для админа в других состояниях)
-# ------------------------------------------------------------
-# (необязательно, но для отлова случайных команд)
 
 # ============ WEBHOOK ============
 async def handle_webhook(request: web.Request):
