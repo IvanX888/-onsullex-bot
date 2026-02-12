@@ -299,10 +299,6 @@ async def admin_end_chat(message: Message, state: FSMContext):
         await end_chat_for_client(client_id, "Юрист завершил консультацию")
         await end_chat_for_admin(message.from_user.id, state, f"Диалог с {client_name} завершён")
 
-@dp.message(StateFilter(AdminState.talking_to_client), F.text == "📊 Статистика")
-async def admin_stats_chat(message: Message, state: FSMContext):
-    await message.answer(f"📊 Активных: {len(active_chats)}")
-
 @dp.message(StateFilter(AdminState.talking_to_client))
 async def admin_to_client(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -375,16 +371,28 @@ async def end_chat_for_admin(admin_id: int, state: FSMContext, text: str):
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
 
-# ============ WEBHOOK ============
+# ============ WEBHOOK (ИСПРАВЛЕННЫЙ) ============
 
 async def handle_webhook(request: web.Request):
+    """Обработка входящих обновлений от Telegram"""
     try:
+        # Получаем JSON данные
         data = await request.json()
-        update = Update.model_validate(data, context={"bot": bot})
-        await dp.feed_update(bot, update)
-        return web.Response(text="OK")
+        logger.info(f"📩 Получен webhook: {data.get('update_id', 'unknown')}")
+        
+        # Создаем Update объект с правильным контекстом
+        update = Update(**data)
+        update.bot = bot  # Привязываем бота напрямую
+        
+        # Обрабатываем обновление
+        result = await dp.feed_update(bot, update)
+        
+        # Возвращаем успешный ответ
+        return web.Response(text="OK", status=200)
+        
     except Exception as e:
-        logger.error(f"❌ Webhook error: {e}")
+        logger.error(f"❌ Ошибка webhook: {e}", exc_info=True)
+        # Всегда возвращаем 200, чтобы Telegram не повторял запрос
         return web.Response(text="Error", status=200)
 
 async def health(request: web.Request):
@@ -423,13 +431,12 @@ def main():
     
     logger.info(f"🚀 Старт на порту {port}")
     
-    # ВАЖНО: запускаем с правильными параметрами для Render
     web.run_app(
         app,
-        host="0.0.0.0",  # Слушаем все интерфейсы
+        host="0.0.0.0",
         port=port,
-        access_log=logger,  # Логируем доступ
-        print=None  # Отключаем стандартный вывод aiohttp
+        access_log=logger,
+        print=None
     )
 
 if __name__ == "__main__":
