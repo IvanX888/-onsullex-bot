@@ -380,12 +380,8 @@ async def handle_webhook(request: web.Request):
         data = await request.json()
         logger.info(f"📩 Получен webhook: {data.get('update_id', 'unknown')}")
         
-        # Создаем Update объект с правильным контекстом
-        update = Update(**data)
-        update.bot = bot  # Привязываем бота напрямую
-        
-        # Обрабатываем обновление
-        result = await dp.feed_update(bot, update)
+        # Используем feed_raw_update - принимает словарь и сам создаёт Update
+        result = await dp.feed_raw_update(bot, data)
         
         # Возвращаем успешный ответ
         return web.Response(text="OK", status=200)
@@ -441,3 +437,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
