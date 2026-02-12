@@ -633,8 +633,8 @@ async def client_bot_chat(message: Message, state: FSMContext):
     await message.answer(answer, reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
 
 # ============ АДМИН-РОУТЕР ============
+# Создаём роутер
 admin_router = Router()
-dp.include_router(admin_router)
 
 # ---------- 3. АДМИН: ДИАЛОГ С КЛИЕНТОМ ----------
 @admin_router.callback_query(F.data.startswith("start_chat:"))
@@ -649,45 +649,49 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
     client_id = int(parts[1])
     client_name = parts[2] if len(parts) > 2 else "Клиент"
 
-    # Проверяем, не ведёт ли админ уже другой диалог
+    # Обновляем информацию о клиенте
+    await update_client_info(client_id, client_name, None)
+
+    # 🔥 ЗАЩИТА ОТ ПЕРЕКЛЮЧЕНИЯ МЕЖДУ КЛИЕНТАМИ
     current_state = await state.get_state()
     if current_state == AdminState.talking_to_client:
         current_data = await state.get_data()
         current_client = current_data.get('talking_to')
-        current_name = current_data.get('client_name', 'Клиент')
-        
         if current_client and current_client != client_id:
             await callback.answer(
-                f"⚠️ Вы уже в чате с {current_name} (ID: {current_client})!\n"
+                f"⚠️ Вы уже в чате с {current_data.get('client_name', 'Клиент')} (ID: {current_client})!\n"
                 f"Завершите текущий диалог перед ответом новому клиенту.",
                 show_alert=True
             )
             return
-        elif current_client == client_id:
-            # Уже в чате с этим же клиентом — либо восстанавливаем, либо игнорируем
-            if current_state != AdminState.talking_to_client:
-                # Восстановление (если состояние сброшено)
-                await state.set_state(AdminState.talking_to_client)
-                await state.update_data(talking_to=client_id, client_name=client_name, waiting_contacts=False)
-                await callback.message.answer(
-                    f"🔄 <b>Диалог восстановлен</b>\n\nОбщение с <b>{client_name}</b>\nID: <code>{client_id}</code>",
-                    reply_markup=admin_in_chat_menu(client_name),
-                    parse_mode=ParseMode.HTML
-                )
-                await callback.answer("✅ Диалог восстановлен", show_alert=False)
-            else:
-                await callback.answer("✅ Вы уже в чате с этим клиентом.", show_alert=True)
-            return
 
-    # Далее обычная проверка бана, занятости клиента другим админом и т.д.
+    # Проверка бана
     if await is_client_banned(client_id):
         await callback.answer("⛔ Клиент забанен, невозможно начать диалог.", show_alert=True)
         return
 
+    # Проверка, не занят ли клиент другим админом
     existing_admin = await get_active_chat(client_id)
     if existing_admin and existing_admin != callback.from_user.id:
         logger.warning(f"⚠️ Админ {callback.from_user.id} пытался подключиться к клиенту {client_id}, но он уже в чате с {existing_admin}")
         await callback.answer("⚠️ Клиент уже находится в активном чате с другим админом.", show_alert=True)
+        return
+
+    # 🔥 ВОССТАНОВЛЕНИЕ ДИАЛОГА (если клиент уже в active_chats с этим админом, но состояние сброшено)
+    if existing_admin == callback.from_user.id:
+        current_state = await state.get_state()
+        if current_state != AdminState.talking_to_client:
+            logger.info(f"🔄 Восстановление диалога для админа {callback.from_user.id} с клиентом {client_id}")
+            await state.set_state(AdminState.talking_to_client)
+            await state.update_data(talking_to=client_id, client_name=client_name, waiting_contacts=False)
+            await callback.message.answer(
+                f"🔄 <b>Диалог восстановлен</b>\n\nОбщение с <b>{client_name}</b>\nID: <code>{client_id}</code>",
+                reply_markup=admin_in_chat_menu(client_name),
+                parse_mode=ParseMode.HTML
+            )
+            await callback.answer("✅ Диалог восстановлен", show_alert=False)
+        else:
+            await callback.answer("✅ Вы уже в чате с этим клиентом.", show_alert=True)
         return
 
     # Новый диалог
@@ -807,7 +811,7 @@ async def admin_end_chat(message: Message, state: FSMContext):
         await end_chat_for_client(client_id, "Юрист завершил консультацию")
         await end_chat_for_admin(message.from_user.id, state, f"Диалог с {client_name} завершён")
 
-# 🔥 НОВЫЙ ОБРАБОТЧИК: статистика в диалоге
+# 🔥 ОБРАБОТЧИК СТАТИСТИКИ В ДИАЛОГЕ
 @admin_router.message(StateFilter(AdminState.talking_to_client), F.text == "📊 Статистика")
 async def admin_stats_in_chat(message: Message, state: FSMContext):
     chats = await get_all_active_chats()
@@ -829,7 +833,7 @@ async def admin_stats_in_chat(message: Message, state: FSMContext):
         parse_mode=ParseMode.HTML
     )
 
-# 🔥 НОВЫЙ ОБРАБОТЧИК: блокировка кнопок управления в диалоге
+# 🔥 БЛОКИРОВКА КНОПОК УПРАВЛЕНИЯ В ДИАЛОГЕ
 @admin_router.message(StateFilter(AdminState.talking_to_client), F.text.in_(["👥 Управление клиентами", "🔄 Перезапустить бота"]))
 async def admin_blocked_in_chat(message: Message, state: FSMContext):
     await message.answer(
@@ -1072,6 +1076,9 @@ async def admin_stats(message: Message, state: FSMContext):
         parse_mode=ParseMode.HTML
     )
 
+# ============ ПОДКЛЮЧАЕМ РОУТЕР (ТОЛЬКО ПОСЛЕ ВСЕХ ДЕКОРАТОРОВ) ============
+dp.include_router(admin_router)
+
 # ---------- 8. ОБРАБОТЧИК ДЛЯ СВОБОДНОГО АДМИНА ----------
 @dp.message(StateFilter(AdminState.idle))
 async def admin_idle(message: Message, state: FSMContext):
@@ -1130,4 +1137,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
