@@ -138,17 +138,13 @@ async def safe_send_voice(chat_id: int, voice, caption: str = None, **kwargs):
 async def end_chat_for_client(client_id: int, text: str):
     """Полное и гарантированное завершение диалога со стороны клиента."""
     try:
-        # Сначала удаляем из active_chats (всегда)
         await remove_active_chat(client_id)
     except Exception as e:
         logger.error(f"Ошибка при удалении active_chat {client_id}: {e}")
     finally:
-        # Сбрасываем состояние клиента
         client_state = get_fsm_context(client_id)
         await client_state.clear()
         await client_state.set_state(ClientState.menu)
-
-        # Отправляем уведомление (если получится)
         await safe_send_message(
             client_id,
             f"👨‍⚖️ <b>{text}</b>\n\nНажмите 👨‍⚖️ Связаться с юристом снова",
@@ -301,12 +297,17 @@ async def client_call_lawyer(message: Message, state: FSMContext):
     uid = message.from_user.id
     user = message.from_user
 
-    # 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: принудительно завершаем старый диалог, если он есть
-    existing = await get_active_chat(uid)
-    if existing:
-        logger.info(f"🔄 Клиент {uid} переподключается. Завершаем старый диалог с админом {existing}.")
+    # 🔥 Принудительно завершаем старый диалог, если он есть, и уведомляем админа
+    existing_admin = await get_active_chat(uid)
+    if existing_admin:
+        logger.info(f"🔄 Клиент {uid} переподключается. Завершаем старый диалог с админом {existing_admin}.")
+        # Завершаем диалог для админа (сбрасываем его состояние и уведомляем)
+        admin_state = get_fsm_context(existing_admin)
+        await end_chat_for_admin(existing_admin, admin_state, "Клиент начал новый диалог")
+        # Завершаем диалог для клиента (удаляем active_chat, сбрасываем состояние)
         await end_chat_for_client(uid, "Старый диалог завершён (новое обращение)")
 
+    # Теперь устанавливаем новое состояние
     await state.set_state(ClientState.talking_to_lawyer)
 
     await message.answer(
@@ -417,12 +418,21 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
     client_id = int(parts[1])
     client_name = parts[2] if len(parts) > 2 else "Клиент"
 
-    # Проверяем, не занят ли клиент другим админом
+    # 🔥 Разрешаем тому же админу подключаться, даже если клиент уже в active_chats с ним же (старая кнопка)
     existing_admin = await get_active_chat(client_id)
-    if existing_admin:
+    if existing_admin and existing_admin != callback.from_user.id:
         logger.warning(f"⚠️ Админ {callback.from_user.id} пытался подключиться к клиенту {client_id}, но он уже в чате с {existing_admin}")
-        await callback.answer("⚠️ Клиент уже находится в активном чате. Возможно, это новое обращение — нажмите на свежее уведомление.", show_alert=True)
+        await callback.answer("⚠️ Клиент уже находится в активном чате с другим админом.", show_alert=True)
         return
+
+    # Если клиент уже в active_chats с этим же админом — перезапускаем диалог
+    if existing_admin == callback.from_user.id:
+        logger.info(f"🔄 Админ {callback.from_user.id} повторно нажал на кнопку клиента {client_id}. Перезапускаем диалог.")
+        # Завершаем старый диалог для админа (если он в состоянии чата)
+        admin_state = get_fsm_context(callback.from_user.id)
+        await end_chat_for_admin(callback.from_user.id, admin_state, "Диалог перезапущен")
+        # Удаляем клиента из active_chats (чтобы чисто начать)
+        await remove_active_chat(client_id)
 
     await state.set_state(AdminState.talking_to_client)
     await state.update_data(talking_to=client_id, client_name=client_name)
