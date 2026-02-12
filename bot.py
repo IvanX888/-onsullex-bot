@@ -334,7 +334,7 @@ async def client_call_lawyer(message: Message, state: FSMContext):
     uid = message.from_user.id
     user = message.from_user
 
-    # 🔥 Принудительно завершаем старый диалог, если он есть, и уведомляем админа
+    # Принудительно завершаем старый диалог, если он есть, и уведомляем админа
     existing_admin = await get_active_chat(uid)
     if existing_admin:
         logger.info(f"🔄 Клиент {uid} переподключается. Завершаем старый диалог с админом {existing_admin}.")
@@ -389,9 +389,23 @@ async def client_to_lawyer(message: Message, state: FSMContext):
         await state.set_state(ClientState.menu)
         return
 
+    # Логируем попытку отправки
+    logger.info(f"📤 Клиент {uid} -> Админ {admin_id}: {message.text[:50] if message.text else '[не текст]'}")
+
+    # Проверяем, не ждёт ли админ контакты (флаг в состоянии админа)
+    admin_state = get_fsm_context(admin_id)
+    admin_data = await admin_state.get_data()
+    waiting_contacts = admin_data.get('waiting_contacts', False)
+
+    header = f"💬 <b>{user.full_name}</b>"
+    if waiting_contacts:
+        header += " [📞 КОНТАКТНЫЕ ДАННЫЕ]"
+        # Сбрасываем флаг после первого ответа
+        await admin_state.update_data(waiting_contacts=False)
+    header += "\n—\n"
+
     sent = False
     try:
-        header = f"💬 <b>{user.full_name}</b>\n—\n"
         if message.text:
             sent = await safe_send_message(admin_id, header + message.text, parse_mode=ParseMode.HTML)
         elif message.photo:
@@ -407,7 +421,7 @@ async def client_to_lawyer(message: Message, state: FSMContext):
                 parse_mode=ParseMode.HTML
             )
         elif message.voice:
-            await safe_send_message(admin_id, f"💬 <b>{user.full_name}</b>\n—\n🎤 Голосовое:", parse_mode=ParseMode.HTML)
+            await safe_send_message(admin_id, f"{header}\n🎤 Голосовое:", parse_mode=ParseMode.HTML)
             sent = await safe_send_voice(admin_id, message.voice.file_id, parse_mode=ParseMode.HTML)
         else:
             await message.reply("❌ Неподдерживаемый тип сообщения")
@@ -420,6 +434,12 @@ async def client_to_lawyer(message: Message, state: FSMContext):
                 await message.reply("✅ Отправлено юристу")
             else:
                 await message.reply("⚠️ Не удалось отправить, попробуйте позже")
+
+        if sent:
+            logger.info(f"✅ Сообщение от клиента {uid} доставлено админу {admin_id}")
+        else:
+            logger.warning(f"⚠️ Сообщение от клиента {uid} НЕ доставлено админу {admin_id}")
+
     except Exception as e:
         logger.error(f"❌ Ошибка отправки клиентом: {e}")
         await message.reply("⚠️ Ошибка отправки")
@@ -466,7 +486,7 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
         await remove_active_chat(client_id)
 
     await state.set_state(AdminState.talking_to_client)
-    await state.update_data(talking_to=client_id, client_name=client_name)
+    await state.update_data(talking_to=client_id, client_name=client_name, waiting_contacts=False)
     await set_active_chat(client_id, callback.from_user.id)
 
     await callback.message.answer(
@@ -504,7 +524,6 @@ async def admin_send_price_list(message: Message, state: FSMContext):
 
     if not await get_active_chat(client_id):
         await message.answer("⚠️ Клиент отключился или завершил диалог")
-        # Завершаем состояние админа, чтобы не зависло
         await state.clear()
         await state.set_state(AdminState.idle)
         await message.answer("Вы свободны", reply_markup=admin_idle_menu())
@@ -513,6 +532,7 @@ async def admin_send_price_list(message: Message, state: FSMContext):
     sent = await safe_send_message(client_id, PRICE_LIST, parse_mode=ParseMode.HTML)
     if sent:
         await message.answer("✅ Прайс-лист отправлен клиенту")
+        logger.info(f"📤 Админ отправил прайс-лист клиенту {client_id}")
     else:
         await message.answer("❌ Не удалось отправить прайс-лист")
 
@@ -531,9 +551,12 @@ async def admin_ask_contacts(message: Message, state: FSMContext):
         await message.answer("Вы свободны", reply_markup=admin_idle_menu())
         return
 
+    # Устанавливаем флаг, что мы ждём контакты от этого клиента
+    await state.update_data(waiting_contacts=True)
     sent = await safe_send_message(client_id, ASK_CONTACTS, parse_mode=ParseMode.HTML)
     if sent:
         await message.answer("✅ Запрос контактов отправлен клиенту")
+        logger.info(f"📤 Админ запросил контакты у клиента {client_id}")
     else:
         await message.answer("❌ Не удалось отправить запрос")
 
@@ -555,6 +578,7 @@ async def admin_cannot_help(message: Message, state: FSMContext):
     sent = await safe_send_message(client_id, CANNOT_HELP, parse_mode=ParseMode.HTML)
     if sent:
         await message.answer("✅ Уведомление об отказе отправлено клиенту")
+        logger.info(f"📤 Админ отказал клиенту {client_id}")
     else:
         await message.answer("❌ Не удалось отправить уведомление")
 
@@ -612,6 +636,7 @@ async def admin_to_client(message: Message, state: FSMContext):
 
         if sent:
             await message.answer("✅ Отправлено")
+            logger.info(f"📤 Админ -> Клиент {client_id}: {message.text[:50] if message.text else '[не текст]'}")
         else:
             await message.answer("⚠️ Ошибка отправки (возможно, клиент недоступен)")
     except Exception as e:
@@ -623,7 +648,6 @@ async def admin_to_client(message: Message, state: FSMContext):
 async def admin_idle(message: Message, state: FSMContext):
     if message.text and message.text.startswith('/'):
         return
-    # Если админ в idle и нажал статистику — обработается выше, сюда не попадёт
     await message.answer("ℹ️ Вы свободны. Ждите клиента или нажмите /start", reply_markup=admin_idle_menu())
 
 # ============ WEBHOOK С БЕЗОПАСНОЙ ОЧЕРЕДЬЮ ============
