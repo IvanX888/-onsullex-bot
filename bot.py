@@ -81,10 +81,8 @@ clients_db = {}
 clients_db_lock = asyncio.Lock()
 
 async def update_client_info(user_id: int, name: str = None, username: str = None, increment_messages: bool = False):
-    """Создаёт или обновляет запись о клиенте (админ игнорируется)."""
     if user_id == ADMIN_ID:
         return
-
     async with clients_db_lock:
         now = datetime.now().isoformat()
         if user_id not in clients_db:
@@ -106,7 +104,6 @@ async def update_client_info(user_id: int, name: str = None, username: str = Non
                 clients_db[user_id]["name"] = name
             if username is not None:
                 clients_db[user_id]["username"] = username
-
         if increment_messages:
             clients_db[user_id]["total_messages"] += 1
 
@@ -152,7 +149,7 @@ async def clean_old_clients():
             to_delete = []
             for uid, info in clients_db.items():
                 if uid in active:
-                    continue  # не удаляем активных
+                    continue
                 last_seen = datetime.fromisoformat(info["last_seen"])
                 if last_seen < cutoff:
                     to_delete.append(uid)
@@ -163,13 +160,11 @@ async def clean_old_clients():
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def get_fsm_context(user_id: int, chat_id: int = None) -> FSMContext:
-    """Внутренний API, используется для кросс-пользовательского доступа."""
     if chat_id is None:
         chat_id = user_id
     key = StorageKey(bot_id=bot.id, user_id=user_id, chat_id=chat_id)
     return FSMContext(storage=dp.storage, key=key)
 
-# ---------- ОТПРАВКА С ТАЙМАУТОМ ----------
 async def safe_send_message(chat_id: int, text: str, **kwargs):
     try:
         await asyncio.wait_for(
@@ -226,7 +221,6 @@ async def safe_send_voice(chat_id: int, voice, caption: str = None, **kwargs):
         logger.error(f"❌ Ошибка отправки голосового для {chat_id}: {e}")
         return False
 
-# ---------- ЗАВЕРШЕНИЕ ДИАЛОГА ----------
 async def end_chat_for_client(client_id: int, text: str):
     logger.info(f"🔚 Завершение диалога для клиента {client_id}: {text}")
     await remove_active_chat(client_id)
@@ -472,7 +466,6 @@ async def client_call_lawyer(message: Message, state: FSMContext):
         logger.info(f"⛔ Забаненный клиент {uid} пытался вызвать юриста")
         return
 
-    # Завершаем старый диалог, если он есть
     existing_admin = await get_active_chat(uid)
     if existing_admin:
         logger.info(f"🔄 Клиент {uid} переподключается. Завершаем старый диалог с админом {existing_admin}.")
@@ -491,7 +484,7 @@ async def client_call_lawyer(message: Message, state: FSMContext):
     )
 
     try:
-        # 🔥 Сначала блокируем клиента, потом отправляем уведомление (предотвращает race condition)
+        # Сначала блокируем клиента, потом отправляем уведомление
         await set_active_chat(uid, ADMIN_ID)
         await safe_send_message(
             ADMIN_ID,
@@ -620,7 +613,6 @@ async def client_to_lawyer(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(ClientState.menu), F.contact)
 async def client_contact_in_menu(message: Message, state: FSMContext):
-    """Обработка контакта, отправленного из главного меню."""
     await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username, increment_messages=True)
     await message.answer(
         "📞 Получили ваш контакт! Нажмите 👨‍⚖️ Связаться с юристом для консультации.",
@@ -640,10 +632,11 @@ async def client_bot_chat(message: Message, state: FSMContext):
         answer = "🤔 Нажмите 👨‍⚖️ Связаться с юристом для помощи"
     await message.answer(answer, reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
 
-# ---------- 3. АДМИН: СОЗДАЁМ РОУТЕР И ПОДКЛЮЧАЕМ ЕГО ДО ХЕНДЛЕРОВ ----------
+# ============ АДМИН-РОУТЕР ============
 admin_router = Router()
 dp.include_router(admin_router)
 
+# ---------- 3. АДМИН: ДИАЛОГ С КЛИЕНТОМ ----------
 @admin_router.callback_query(F.data.startswith("start_chat:"))
 async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -652,32 +645,47 @@ async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
 
     logger.info(f"📞 Админ {callback.from_user.id} нажал 'Ответить'")
 
-    current_state = await state.get_state()
-    if current_state == AdminState.talking_to_client:
-        await callback.answer("⚠️ Вы уже ведёте диалог. Завершите его сначала.", show_alert=True)
-        return
-
     parts = callback.data.split(":")
     client_id = int(parts[1])
     client_name = parts[2] if len(parts) > 2 else "Клиент"
 
+    # Обновляем информацию о клиенте
     await update_client_info(client_id, client_name, None)
 
+    # Проверка бана
     if await is_client_banned(client_id):
         await callback.answer("⛔ Клиент забанен, невозможно начать диалог.", show_alert=True)
         return
 
+    # Проверка, не занят ли клиент другим админом
     existing_admin = await get_active_chat(client_id)
     if existing_admin and existing_admin != callback.from_user.id:
         logger.warning(f"⚠️ Админ {callback.from_user.id} пытался подключиться к клиенту {client_id}, но он уже в чате с {existing_admin}")
         await callback.answer("⚠️ Клиент уже находится в активном чате с другим админом.", show_alert=True)
         return
 
+    # 🔥 ВОССТАНОВЛЕНИЕ ДИАЛОГА: если клиент уже в active_chats с этим админом
     if existing_admin == callback.from_user.id:
-        logger.info(f"🔄 Админ {callback.from_user.id} повторно нажал на кнопку клиента {client_id}, диалог уже активен.")
-        await callback.answer("✅ Вы уже в чате с этим клиентом.", show_alert=True)
+        # Проверяем текущее состояние админа
+        current_state = await state.get_state()
+        if current_state != AdminState.talking_to_client:
+            logger.info(f"🔄 Восстановление диалога для админа {callback.from_user.id} с клиентом {client_id}")
+            # Восстанавливаем состояние диалога
+            await state.set_state(AdminState.talking_to_client)
+            await state.update_data(talking_to=client_id, client_name=client_name, waiting_contacts=False)
+            # Убеждаемся, что active_chat есть (он уже должен быть)
+            await callback.message.answer(
+                f"🔄 <b>Диалог восстановлен</b>\n\nОбщение с <b>{client_name}</b>\nID: <code>{client_id}</code>",
+                reply_markup=admin_in_chat_menu(client_name),
+                parse_mode=ParseMode.HTML
+            )
+            await callback.answer("✅ Диалог восстановлен", show_alert=False)
+        else:
+            # Уже в диалоге, просто уведомляем
+            await callback.answer("✅ Вы уже в чате с этим клиентом.", show_alert=True)
         return
 
+    # Новый диалог
     await state.set_state(AdminState.talking_to_client)
     await state.update_data(talking_to=client_id, client_name=client_name, waiting_contacts=False)
     await set_active_chat(client_id, callback.from_user.id)
@@ -794,7 +802,7 @@ async def admin_end_chat(message: Message, state: FSMContext):
         await end_chat_for_client(client_id, "Юрист завершил консультацию")
         await end_chat_for_admin(message.from_user.id, state, f"Диалог с {client_name} завершён")
 
-# ✅ Обработчик кнопки "📊 Статистика" в диалоге – отправляет статистику админу, а не клиенту
+# 🔥 НОВЫЙ ОБРАБОТЧИК: статистика в диалоге
 @admin_router.message(StateFilter(AdminState.talking_to_client), F.text == "📊 Статистика")
 async def admin_stats_in_chat(message: Message, state: FSMContext):
     chats = await get_all_active_chats()
@@ -813,6 +821,15 @@ async def admin_stats_in_chat(message: Message, state: FSMContext):
         f"🔒 Заблокировано: {banned_clients}\n"
         f"💬 Активных диалогов: {count}\n"
         f"🆔 Активные клиенты: {clients_list if clients_list else 'нет'}",
+        parse_mode=ParseMode.HTML
+    )
+
+# 🔥 НОВЫЙ ОБРАБОТЧИК: блокировка кнопок управления в диалоге
+@admin_router.message(StateFilter(AdminState.talking_to_client), F.text.in_(["👥 Управление клиентами", "🔄 Перезапустить бота"]))
+async def admin_blocked_in_chat(message: Message, state: FSMContext):
+    await message.answer(
+        "⚠️ <b>Сначала завершите диалог с клиентом!</b>\n\n"
+        "Используйте кнопку ❌ Завершить диалог",
         parse_mode=ParseMode.HTML
     )
 
@@ -884,7 +901,6 @@ async def admin_manage_clients_entry(message: Message, state: FSMContext):
 async def admin_restart(message: Message, state: FSMContext):
     await message.answer("♻️ Перезапуск...")
     logger.info(f"🔄 Админ {ADMIN_ID} инициировал перезапуск бота")
-    # Отправляем SIGTERM самому себе — Render перезапустит контейнер
     os.kill(os.getpid(), signal.SIGTERM)
 
 @admin_router.message(F.from_user.id == ADMIN_ID, F.text.in_([
@@ -953,7 +969,6 @@ async def admin_manage_buttons_handler(message: Message, state: FSMContext):
 async def admin_process_client_id(message: Message, state: FSMContext):
     if not message.text or message.text.startswith('/'):
         return
-
     if message.text in ["◀️ Назад в админ-панель", "📋 Список клиентов", "🔒 Заблокировать", "🔓 Разблокировать", "📝 Отправить напоминание"]:
         return
 
@@ -1002,7 +1017,6 @@ async def admin_process_client_id(message: Message, state: FSMContext):
 async def admin_send_reminder_text(message: Message, state: FSMContext):
     if not message.text or message.text.startswith('/'):
         return
-
     if message.text in ["◀️ Назад в админ-панель", "📋 Список клиентов", "🔒 Заблокировать", "🔓 Разблокировать", "📝 Отправить напоминание"]:
         return
 
@@ -1062,16 +1076,14 @@ async def admin_idle(message: Message, state: FSMContext):
 
 # ============ WEBHOOK ============
 async def handle_webhook(request: web.Request):
-    """Синхронная обработка вебхука с таймаутом — гарантия обработки до ответа."""
+    """Синхронная обработка вебхука с таймаутом 55 секунд."""
     try:
         data = await request.json()
-        logger.info(f"📩 Webhook received: {data.get('update_id', 'unknown')}")
-        # Ждём обработку с таймаутом 5 секунд (Telegram ждёт ~60, но лучше отвечать быстро)
-        await asyncio.wait_for(dp.feed_raw_update(bot, data), timeout=5.0)
+        logger.debug(f"📩 Webhook received: {data.get('update_id', 'unknown')}")
+        await asyncio.wait_for(dp.feed_raw_update(bot, data), timeout=55.0)
         return web.Response(text="OK", status=200)
     except asyncio.TimeoutError:
-        logger.error("⏰ Webhook processing timeout")
-        # Всё равно отвечаем OK, чтобы Telegram не слал повторно
+        logger.error("⏰ Webhook processing timeout (55s)")
         return web.Response(text="OK", status=200)
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}", exc_info=True)
@@ -1098,7 +1110,7 @@ async def main():
     await site.start()
     logger.info(f"🚀 Сервер запущен на порту {port}")
 
-    # Запускаем фоновую очистку старых клиентов
+    # Фоновая очистка неактивных клиентов
     asyncio.create_task(clean_old_clients())
 
     webhook_url = f"{WEBHOOK_URL}/webhook"
@@ -1109,7 +1121,6 @@ async def main():
     except Exception as e:
         logger.error(f"❌ Ошибка установки webhook: {e}")
 
-    # Ожидаем сигналов завершения
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
