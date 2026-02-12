@@ -371,24 +371,21 @@ async def end_chat_for_admin(admin_id: int, state: FSMContext, text: str):
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
 
-# ============ WEBHOOK (ИСПРАВЛЕННЫЙ) ============
+# ============ WEBHOOK ============
 
 async def handle_webhook(request: web.Request):
     """Обработка входящих обновлений от Telegram"""
     try:
-        # Получаем JSON данные
         data = await request.json()
         logger.info(f"📩 Получен webhook: {data.get('update_id', 'unknown')}")
         
-        # Используем feed_raw_update - принимает словарь и сам создаёт Update
+        # Используем feed_raw_update - принимает словарь
         result = await dp.feed_raw_update(bot, data)
         
-        # Возвращаем успешный ответ
         return web.Response(text="OK", status=200)
         
     except Exception as e:
         logger.error(f"❌ Ошибка webhook: {e}", exc_info=True)
-        # Всегда возвращаем 200, чтобы Telegram не повторял запрос
         return web.Response(text="Error", status=200)
 
 async def health(request: web.Request):
@@ -397,44 +394,39 @@ async def health(request: web.Request):
 async def root(request: web.Request):
     return web.Response(text=f"Bot OK. Admin: {ADMIN_ID}")
 
-async def on_startup(app: web.Application):
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(webhook_url)
-        logger.info(f"✅ Webhook: {webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ Webhook error: {e}")
+# ============ ГЛАВНАЯ ФУНКЦИЯ ============
 
-async def on_shutdown(app: web.Application):
-    try:
-        await bot.delete_webhook()
-        await bot.session.close()
-    except Exception as e:
-        logger.error(f"❌ Shutdown error: {e}")
-
-# ============ ЗАПУСК ============
-
-def main():
+async def main():
+    """Главная функция - запускает сервер и устанавливает webhook"""
     port = int(os.getenv("PORT", "10000"))
     
+    # Создаём приложение
     app = web.Application()
     app.router.add_get("/", root)
     app.router.add_get("/health", health)
     app.router.add_post("/webhook", handle_webhook)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
     
-    logger.info(f"🚀 Старт на порту {port}")
+    # Запускаем сервер в фоне (чтобы Render увидел порт сразу)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
     
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=port,
-        access_log=logger,
-        print=None
-    )
+    logger.info(f"🚀 Запуск сервера на порту {port}...")
+    await site.start()
+    logger.info(f"✅ Сервер запущен на порту {port}")
+    
+    # Теперь устанавливаем webhook (после запуска сервера)
+    webhook_url = f"{WEBHOOK_URL}/webhook"
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(webhook_url)
+        logger.info(f"✅ Webhook установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка webhook: {e}")
+    
+    # Держим программу живой
+    while True:
+        await asyncio.sleep(3600)  # Спим час
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(main())
