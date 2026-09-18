@@ -1,1097 +1,657 @@
-import os
-import sys
-import signal
-import sqlite3
-import logging
-import asyncio
+# -*- coding: utf-8 -*-
+"""
+Мой день — Telegram-бот напоминаний (версия без aiogram — работает на Termux без компиляции).
+Установка: pip install -r requirements.txt   (нужен ffmpeg для голосовых)
+Запуск: BOT_TOKEN=токен python bot.py
+"""
+import os, json, re, time, logging, tempfile, subprocess, threading
 from datetime import datetime, timedelta
-from contextlib import contextmanager
-from aiohttp import web
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, StateFilter
-from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    Message, CallbackQuery, Contact
-)
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.storage.base import StorageKey
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ============ ЛОГИРОВАНИЕ ============
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+import requests
 
-# ============ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ============
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "717849646"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://consullex-bot.onrender.com").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_СЮДА")
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "myday_data.json")
+SEND_VOICE = True
+CHECK_SEC = 30
 
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не установлен!")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("myday")
 
-logger.info(f"🔧 ADMIN_ID: {ADMIN_ID}")
-
-# ============ SQLite БАЗА ДАННЫХ ============
-DB_PATH = "clients.db"
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS clients (
-                user_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                username TEXT,
-                first_seen TEXT NOT NULL,
-                last_seen TEXT NOT NULL,
-                banned INTEGER DEFAULT 0,
-                ban_reason TEXT,
-                total_messages INTEGER DEFAULT 0,
-                chats_count INTEGER DEFAULT 0
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_banned ON clients(banned)")
-
-init_db()
-
-@contextmanager
-def db_cursor():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+# ================== ХРАНИЛИЩЕ ==================
+STORE_LOCK = threading.Lock()
+def load_data():
     try:
-        yield conn.cursor()
-        conn.commit()
-    finally:
-        conn.close()
+        with open(DATA_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"users": {}, "links": {}}
 
-async def update_client_info(user_id: int, name: str = None, username: str = None, increment_messages: bool = False):
-    if user_id == ADMIN_ID:
-        return
-    now = datetime.now().isoformat()
-    with db_cursor() as cur:
-        cur.execute("SELECT user_id FROM clients WHERE user_id = ?", (user_id,))
-        exists = cur.fetchone()
-        if not exists:
-            cur.execute("""
-                INSERT INTO clients (user_id, name, username, first_seen, last_seen, banned, total_messages)
-                VALUES (?, ?, ?, ?, ?, 0, ?)
-            """, (user_id, name or f"User{user_id}", username, now, now, 1 if increment_messages else 0))
-            logger.info(f"🆕 Создана запись клиента {user_id} ({name})")
-        else:
-            update_fields = ["last_seen = ?"]
-            params = [now]
-            if name:
-                update_fields.append("name = ?")
-                params.append(name)
-            if username is not None:
-                update_fields.append("username = ?")
-                params.append(username)
-            if increment_messages:
-                update_fields.append("total_messages = total_messages + 1")
-            params.append(user_id)
-            cur.execute(f"""
-                UPDATE clients
-                SET {', '.join(update_fields)}
-                WHERE user_id = ?
-            """, params)
+def save_data(d):
+    with STORE_LOCK:
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, DATA_FILE)
 
-async def is_client_banned(user_id: int) -> bool:
-    if user_id == ADMIN_ID:
-        return False
-    with db_cursor() as cur:
-        cur.execute("SELECT banned FROM clients WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        return bool(row and row["banned"])
+def new_profile(name):
+    return {"name": name, "username": None, "active": None, "tasks": [],
+            "snooze": 15, "repeat": 30, "shared": False,
+            "helpers": [], "created": datetime.now().isoformat()}
 
-async def set_client_ban(user_id: int, ban: bool, reason: str = None):
-    with db_cursor() as cur:
-        cur.execute("""
-            INSERT INTO clients (user_id, name, username, first_seen, last_seen, banned, ban_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                banned = excluded.banned,
-                ban_reason = excluded.ban_reason,
-                last_seen = excluded.last_seen
-        """, (
-            user_id, f"User{user_id}", None,
-            datetime.now().isoformat(), datetime.now().isoformat(),
-            1 if ban else 0, reason
-        ))
+# ---- активный задачник ----
+def active_owner(d, uid):
+    u = d["users"].get(uid, {})
+    a = u.get("active")
+    if a and a in d["users"] and (a == uid or uid in d["users"][a].get("helpers", [])):
+        return a
+    return uid
 
-async def get_all_clients():
-    with db_cursor() as cur:
-        cur.execute("""
-            SELECT user_id, name, username, last_seen, banned
-            FROM clients
-            ORDER BY last_seen DESC
-        """)
-        rows = cur.fetchall()
-        return {row["user_id"]: dict(row) for row in rows}
+def accessible(d, uid):
+    acc = [(uid, d["users"].get(uid, new_profile("Я"))["name"])]
+    for k, v in d["users"].items():
+        if uid in v.get("helpers", []):
+            acc.append((k, v["name"]))
+    return acc
 
-async def get_client_info(user_id: int):
-    with db_cursor() as cur:
-        cur.execute("SELECT * FROM clients WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        return dict(row) if row else None
+# ================== TELEGRAM API (через requests) ==================
+def tg(method, **params):
+    for attempt in range(3):
+        try:
+            r = requests.post(f"{API}/{method}", data=params, timeout=30)
+            return r.json()
+        except Exception as e:
+            log.warning(f"{method} попытка {attempt+1}: {e}")
+            time.sleep(3)
+    return {}
 
-async def clean_old_clients():
-    while True:
-        await asyncio.sleep(86400)
-        cutoff = (datetime.now() - timedelta(days=30)).isoformat()
-        active = await get_all_active_chats()
-        placeholders = ','.join('?' * len(active)) if active else 'NULL'
-        with db_cursor() as cur:
-            if active:
-                cur.execute(f"""
-                    DELETE FROM clients
-                    WHERE last_seen < ? AND user_id NOT IN ({placeholders})
-                """, (cutoff, *active))
-            else:
-                cur.execute("DELETE FROM clients WHERE last_seen < ?", (cutoff,))
-            deleted = cur.rowcount
-            if deleted:
-                logger.info(f"🧹 Удалено {deleted} неактивных клиентов")
-
-# ---------- АКТИВНЫЕ ЧАТЫ ----------
-active_chats = {}
-active_chats_lock = asyncio.Lock()
-
-async def set_active_chat(client_id: int, admin_id: int):
-    async with active_chats_lock:
-        active_chats[client_id] = admin_id
-
-async def remove_active_chat(client_id: int):
-    async with active_chats_lock:
-        if client_id in active_chats:
-            del active_chats[client_id]
-
-async def get_active_chat(client_id: int) -> int | None:
-    async with active_chats_lock:
-        return active_chats.get(client_id)
-
-async def get_all_active_chats():
-    async with active_chats_lock:
-        return active_chats.copy()
-
-# ============ FSM СОСТОЯНИЯ ============
-class ClientState(StatesGroup):
-    menu = State()
-    talking_to_lawyer = State()
-
-class AdminState(StatesGroup):
-    idle = State()
-    talking_to_client = State()
-    managing_clients = State()
-    waiting_client_id = State()
-    waiting_reminder_text = State()
-
-# ============ ИНИЦИАЛИЗАЦИЯ ============
-storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=storage)
-
-def get_fsm_context(user_id: int, chat_id: int = None) -> FSMContext:
-    if chat_id is None:
-        chat_id = user_id
-    key = StorageKey(bot_id=bot.id, user_id=user_id, chat_id=chat_id)
-    return FSMContext(storage=dp.storage, key=key)
-
-async def safe_send_message(chat_id: int, text: str, **kwargs):
+def tg_file(method, file_field, file_bytes, filename, **params):
     try:
-        await asyncio.wait_for(bot.send_message(chat_id, text, **kwargs), timeout=15.0)
-        return True
+        r = requests.post(f"{API}/{method}",
+                          data=params, files={file_field: (filename, file_bytes)},
+                          timeout=60)
+        return r.json()
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки для {chat_id}: {e}")
-        return False
+        log.warning(f"{method}: {e}")
+        return {}
 
-async def safe_send_photo(chat_id: int, photo, caption: str = None, **kwargs):
-    try:
-        await asyncio.wait_for(bot.send_photo(chat_id, photo, caption=caption, **kwargs), timeout=20.0)
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки фото для {chat_id}: {e}")
-        return False
+def send(chat, text, kb=None, rkb=None):
+    params = {"chat_id": chat, "text": text}
+    markup = kb if kb else rkb
+    if markup:
+        params["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+    r = tg("sendMessage", **params)
+    if r and not r.get("ok"):
+        log.warning(f"sendMessage fail: {r.get('description')} | {text[:60]!r}")
+    return r
 
-async def safe_send_document(chat_id: int, document, caption: str = None, **kwargs):
-    try:
-        await asyncio.wait_for(bot.send_document(chat_id, document, caption=caption, **kwargs), timeout=20.0)
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки документа для {chat_id}: {e}")
-        return False
+# главное меню-подсказка под полем ввода (как в боте-юристе)
+def main_kb():
+    return {"keyboard": [
+        [{"text": "📋 Мои задачи"}, {"text": "📊 Отчёт"}],
+        [{"text": "📒 Задачники"}, {"text": "👨‍👧 Код для семьи"}],
+        [{"text": "❓ Помощь"}],
+    ], "resize_keyboard": True}
 
-async def safe_send_voice(chat_id: int, voice, caption: str = None, **kwargs):
-    try:
-        await asyncio.wait_for(bot.send_voice(chat_id, voice, caption=caption, **kwargs), timeout=20.0)
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки голосового для {chat_id}: {e}")
-        return False
-
-async def end_chat_for_client(client_id: int, text: str):
-    logger.info(f"🔚 Завершение диалога для клиента {client_id}: {text}")
-    await remove_active_chat(client_id)
-    client_state = get_fsm_context(client_id)
-    await client_state.clear()
-    await client_state.set_state(ClientState.menu)
-    await safe_send_message(
-        client_id,
-        f"👨‍⚖️ <b>{text}</b>\n\nНажмите 👨‍⚖️ Связаться с юристом снова",
-        reply_markup=client_main_menu(),
-        parse_mode=ParseMode.HTML
-    )
-
-async def end_chat_for_admin(admin_id: int, state: FSMContext, text: str):
-    logger.info(f"🔚 Завершение диалога для админа {admin_id}: {text}")
-    await state.clear()
-    await state.set_state(AdminState.idle)
-    await safe_send_message(
-        admin_id,
-        f"✅ {text}\n\nВы свободны",
-        reply_markup=admin_idle_menu(),
-        parse_mode=ParseMode.HTML
-    )
-
-# ============ КЛАВИАТУРЫ ============
-def client_main_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📝 Оставить заявку"), KeyboardButton(text="👨‍⚖️ Связаться с юристом")],
-            [KeyboardButton(text="⚖️ Услуги"), KeyboardButton(text="💰 Цены")],
-            [KeyboardButton(text="📞 Контакты"), KeyboardButton(text="❓ Частые вопросы")]
-        ],
-        resize_keyboard=True
-    )
-
-def client_in_chat_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="❌ Завершить разговор с юристом")],
-            [KeyboardButton(text="📞 Телефон для связи")]
-        ],
-        resize_keyboard=True
-    )
-
-def admin_idle_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="👥 Управление клиентами")],
-            [KeyboardButton(text="🔄 Перезапустить бота")]
-        ],
-        resize_keyboard=True
-    )
-
-def admin_manage_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📋 Список клиентов")],
-            [KeyboardButton(text="🔒 Заблокировать"), KeyboardButton(text="🔓 Разблокировать")],
-            [KeyboardButton(text="📝 Отправить напоминание")],
-            [KeyboardButton(text="◀️ Назад в админ-панель")]
-        ],
-        resize_keyboard=True
-    )
-
-def admin_in_chat_menu(client_name: str):
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=f"❌ Завершить диалог с {client_name}")],
-            [KeyboardButton(text="💰 Прайс-лист"), KeyboardButton(text="📞 Запросить контакты")],
-            [KeyboardButton(text="❌ Не можем помочь"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="🔒 Заблокировать этого клиента")]
-        ],
-        resize_keyboard=True
-    )
-
-def is_admin(uid: int) -> bool:
-    return uid == ADMIN_ID
-
-# ============ АКТУАЛИЗИРОВАННЫЕ ТЕКСТЫ (СИНХРОНИЗИРОВАНО С САЙТОМ серко.рф) ============
-BOT_ANSWERS = {
-    "привет": "👋 Здравствуйте! Я помогу вам с юридическими вопросами.\n\nВыберите действие в меню ниже ⬇️",
-    "здравствуйте": "👋 Добрый день! Готов помочь.\n\nВыберите действие в меню ниже ⬇️",
-    "цена": "💰 <b>Стоимость услуг:</b>\n\n• Консультация — 2 000 ₽\n• Документ (иск, жалоба, договор) — от 3 000 ₽\n• Брачный договор — от 4 000 ₽\n• Стартовый пакет (консультация + документ) — от 5 000 ₽\n• Алименты / развод / раздел имущества — от 15 000 ₽\n• Трудовые споры — от 12 000 ₽\n• Защита прав потребителей — от 8 000 ₽\n\nДля точного расчёта нажмите 👨‍⚖️ <b>Связаться с юристом</b>",
-    "стоимость": "💰 Консультация — 2 000 ₽. Документы от 3 000 ₽. Полный прайс в разделе 💰 Цены. Свяжитесь с юристом для расчёта.",
-    "услуги": "⚖️ <b>Мои услуги:</b>\n\n👨‍👩‍👧 <b>Взыскание алиментов</b> (консультация 2 000 ₽)\n• Расчёт размера (25/33/50%), задолженность, пени, индексация, работа с ФССП\n\n💔 <b>Развод</b> (консультация 2 000 ₽)\n• Через ЗАГС или суд, с детьми и имуществом, удалённо\n\n🏠 <b>Раздел имущества</b> (консультация 2 000 ₽)\n• Квартира, машина, вклады, кредиты, мировое соглашение\n\n📝 <b>Брачный договор</b> (от 4 000 ₽)\n• Защита имущества и бизнеса, нотариальное удостоверение\n\n📄 <b>Документы и договоры</b> (от 3 000 ₽)\n• Иски, жалобы, претензии, проверка перед подачей\n\n💼 <b>Трудовые споры</b> (консультация 2 000 ₽)\n• Взыскание зарплаты, незаконное увольнение, компенсация\n\n🛡️ <b>Защита прав потребителей</b> (консультация 2 000 ₽)\n• Возврат товара, штраф 50%, компенсация убытков",
-    "контакты": "📞 <b>Контакты:</b>\n\n📱 +7 (977) 423-24-73\n📧 333742917@mail.ru\n✈️ Telegram: @BYIvanko\n🤖 Telegram-бот: @ConsulLexbot\n💬 MAX: max.ru/u/f9LHodD0cOKLQaqrbDh7KzCMyA51SDd-Ot0J6I2Q-i4Cy4nlitDD6GeCYL0\n🌐 Сайт: https://серко.рф\n🕐 9:00 — 21:00, ежедневно\n🗺️ Москва и вся Россия (онлайн)\n\n<i>Самозанятый юрист. ИНН 500918804320. 127+ решённых дел.</i>",
-    "телефон": "📞 +7 (977) 423-24-73\n\nРаботаю ежедневно с 9:00 до 21:00. Москва и вся Россия онлайн.",
-    "спасибо": "🙏 Пожалуйста! Обращайтесь ещё. Работаю удалённо по всей России, но если нужен выезд — обсудим.",
-    "до свидания": "👋 До свидания! Если появятся вопросы — пишите, отвечаю в течение суток. Сайт: https://серко.рф",
-    "сайт": "🌐 <b>Официальный сайт:</b> https://серко.рф\n\nТам вы найдёте: подробное FAQ, калькулятор алиментов, таблицу прожиточных минимумов по регионам, кейсы и отзывы.",
-    "инн": "📋 <b>Реквизиты:</b>\n\nИНН: 500918804320\nСтатус: самозанятый (НПД)\n\nПроверить статус: https://npd.nalog.ru/check-status/\nРаботаю официально по договору, чек после каждой оплаты.",
-    "регион": "🗺️ <b>Работаю по всей России:</b>\n\nМосква, Московская область, Нижний Новгород, Пермь, Казань, Самара, Волгоград, Краснодар, Ростов-на-Дону, Екатеринбург и другие города.\n\nОнлайн — без доплат за регион. При острой необходимости выезжаю к клиенту.",
+# кнопки-ярлыки -> команды
+BUTTON_CMDS = {
+    "📋 Мои задачи": "/tasks",
+    "📊 Отчёт": "/report",
+    "👨‍👧 Код для семьи": "/code",
+    "📒 Задачники": "/notebooks",
+    "❓ Помощь": "/help",
 }
 
-PRICE_LIST = """
-<b>💰 Прайс-лист (актуально на 2026):</b>
+# голосовые/текстовые синонимы команд
+CMD_SYNONYMS = {
+    "/tasks": ["мои задачи", "покажи задачи", "покажи все задачи", "просмотреть задачи",
+               "посмотреть задачи", "что у меня", "список задач", "все задачи",
+               "что сегодня", "план на сегодня", "что надо сделать", "мой список"],
+    "/report": ["отчёт", "отчет", "итоги", "что сделано", "покажи отчет", "покажи отчёт", "статистика"],
+    "/help": ["помощь", "команды", "что умеешь", "помоги", "справка"],
+    "/code": ["код для семьи", "дай код", "код семье", "подключить семью", "код семьи"],
+    "/ideas": ["мои идеи", "идеи", "заметки", "мои заметки", "что записал"],
+    "/shop": ["что купить", "покупки", "список покупок", "что в магазин", "магазин"],
+    "/notebooks": ["мои задачники", "какие задачники", "список задачников", "какие списки"],
+}
 
-<b>Базовые услуги:</b>
-• Консультация (30–60 мин) — 2 000 ₽
-• Документ (иск, жалоба, претензия) — от 3 000 ₽
-• Брачный договор — от 4 000 ₽
-• Стартовый пакет (консультация + документ) — от 5 000 ₽
+def match_cmd(text):
+    """Ищет команду по синониму. Работает и для голоса после STT."""
+    t = re.sub(r"[.!,?]", "", text.lower().strip())
+    for cmd, phrases in CMD_SYNONYMS.items():
+        for ph in phrases:
+            if t == ph or t.startswith(ph + " ") or (len(ph) > 6 and ph in t):
+                return cmd
+    return None
 
-<b>Специализация:</b>
-• Алименты / развод / раздел имущества — от 15 000 ₽
-• Трудовые споры — от 12 000 ₽
-• Защита прав потребителей — от 8 000 ₽
+# ============ 2) КАТЕГОРИИ ЗАДАЧ ============
+CATS = [
+    ("🛒", "покупка", ["купить", "заказать", "приобрести", "закупить"]),
+    ("📞", "звонок", ["позвонить", "набрать", "перезвонить"]),
+    ("💧", "здоровье", ["воду", "воды", "попить"]),
+    ("💊", "здоровье", ["лекарств", "таблетк", "пилюл"]),
+    ("💡", "идея", ["идея", "придумал", "записать"]),
+]
 
-<i>Точная стоимость зависит от сложности. Оплата поэтапно или по результату. Чек от самозанятого (НПД).</i>
-"""
+def detect_cat(text):
+    for icon, cat, words in CATS:
+        if any(w in text for w in words):
+            return icon, cat
+    return "🗒️", "дело"
 
-ASK_CONTACTS = """
-📝 <b>Оставьте ваши контакты</b>
+def send_voice(chat, text):
+    from gtts import gTTS
+    with tempfile.TemporaryDirectory() as td:
+        mp3 = os.path.join(td, "v.mp3"); ogg = os.path.join(td, "v.ogg")
+        gTTS(text=text, lang="ru").save(mp3)
+        subprocess.run(["ffmpeg", "-y", "-i", mp3, "-c:a", "libopus", "-b:a", "32k", ogg],
+                       capture_output=True)
+        if os.path.exists(ogg):
+            with open(ogg, "rb") as f:
+                tg_file("sendVoice", "voice", f.read(), "v.ogg", chat_id=chat)
 
-Пожалуйста, напишите:
-1. Ваше имя
-2. Номер телефона для связи
-3. Краткое описание вопроса
+def kb(rows):
+    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
 
-Я свяжусь с вами в течение суток.
-WhatsApp для срочных вопросов: +7 (977) 423-24-73
-Сайт: https://серко.рф
-"""
+def kb_task(tid):
+    return kb([[("✅ Сделал", f"done:{tid}"), ("⏰ +15 мин", f"snz:{tid}:15"), ("⏰ +1 час", f"snz:{tid}:60")]])
 
-CANNOT_HELP = """
-❌ <b>К сожалению, я не смогу помочь с этим вопросом.</b>
+# ================== ПАРСЕР «ЧТО И КОГДА» ==================
+WD_STEMS = ["понедельник", "вторник", "сред", "четверг", "пятниц", "суббот", "воскресен"]
+NUMW = {"одиннадцать": 11, "двенадцать": 12, "один": 1, "одного": 1, "два": 2, "двух": 2,
+        "три": 3, "трёх": 3, "трех": 3, "четыре": 4, "четырёх": 4, "четырех": 4,
+        "пять": 5, "пяти": 5, "шесть": 6, "шести": 6, "семь": 7, "семи": 7,
+        "восемь": 8, "восьми": 8, "девять": 9, "девяти": 9, "десять": 10, "десяти": 10}
+DAYPARTS = {"утром": None, "утра": None, "днём": 12, "днем": 12, "дня": 12,
+            "вечером": 18, "вечера": 18, "ночью": 0, "ночи": 0}
 
-Возможно, это выходит за рамки моей компетенции. Рекомендую обратиться к узкоспециализированному юристу.
+def parse_task(raw):
+    """День не указан — сегодня, время не указано — через 30 минут."""
+    text = raw.lower().strip()
+    now = datetime.now()
+    target = now.replace(second=0, microsecond=0)
+    day_label = "сегодня"
 
-Если передумаете или появится другой вопрос — всегда на связи.
-Сайт: https://серко.рф
-"""
+    for i, stem in enumerate(WD_STEMS):
+        mt = re.search(rf"(в[о]?\s*)?{stem}\w*", text)
+        if mt:
+            off = (i - now.weekday()) % 7
+            if off == 0:
+                off = 7
+            target += timedelta(days=off)
+            day_label = f"в {mt.group(0).split()[-1]}"
+            text = text.replace(mt.group(0), "")
+            break
+    if day_label == "сегодня":
+        if "послезавтра" in text:
+            target += timedelta(days=2); day_label = "послезавтра"; text = text.replace("послезавтра", "")
+        elif "завтра" in text:
+            target += timedelta(days=1); day_label = "завтра"; text = text.replace("завтра", "")
 
-BANNED_MESSAGE = """
-⛔ <b>Ваш доступ к юристу временно ограничен.</b>
-
-Пожалуйста, воспользуйтесь другими способами связи:
-📞 +7 (977) 423-24-73
-📧 333742917@mail.ru
-🌐 https://серко.рф
-
-Если вы считаете, что это ошибка, напишите на email.
-"""
-
-CASES_TEXT = """
-🏆 <b>Решённые дела (2025–2026):</b>
-
-💰 <b>175 000 ₽</b> — взыскание зарплаты за 4 месяца + компенсация
-«Уволили и не заплатили. Подготовил документы, подал в суд. Через месяц решение, через неделю деньги на карте.»
-
-💰 <b>225 000 ₽</b> — возврат денег за бракованный товар + штраф
-«Купила технику за 150 тысяч — сломалась на третий день. Составил претензию, потом иск. Суд встал на мою сторону.»
-
-💰 <b>180 000 ₽</b> — алименты за полтора года + пени
-«Бывший платил когда хотел. Посчитал долг, подал в суд. Теперь приставы снимают с зарплаты регулярно.»
-
-💰 <b>320 000 ₽</b> — сохранил квартиру как личное имущество при разводе
-«Жена требовала половину, хотя купил до брака. Нашёл документы, доказал в суде. Квартира осталась мне.»
-
-💰 <b>95 000 ₽</b> — составление брачного договора для защиты бизнеса
-«Перед свадьбой решила подстраховаться. Составил договор, нотариус заверил. Теперь сплю спокойно.»
-
-<i>Всего 127+ решённых дел. Подробнее на сайте: https://серко.рф</i>
-"""
-
-FAQ_TEXT = """
-❓ <b>Частые вопросы:</b>
-
-<b>Сколько стоит консультация?</b>
-Первичная консультация — 2 000 ₽. Бесплатная оценка дела — 5–10 минут в чате.
-
-<b>Как взыскать алименты, если отец не работает?</b>
-Алименты назначаются в твёрдой сумме — прожиточный минимум на ребёнка в вашем регионе (ст. 83 СК РФ).
-
-<b>Можно ли развестись онлайн без присутствия в суде?</b>
-Без детей — через ЗАГС онлайн на Госуслугах. С детьми — через суд, но можно участвовать удалённо.
-
-<b>Как делится ипотечная квартира при разводе?</b>
-Делится поровну (ст. 34 СК РФ). Варианты: продажа, выкуп доли, мировое соглашение.
-
-<b>Что делать, если бывший не платит алименты?</b>
-Обратитесь к приставам. Также можно взыскать пени — 0,1% от долга за каждый день (ст. 115 СК РФ).
-
-<b>Сколько времени занимает развод через суд?</b>
-Без споров — 2–4 месяца. С имуществом или детьми — 6–12 месяцев.
-
-<b>Нужен ли брачный договор, если нет детей?</b>
-Да — защищает имущество, бизнес, инвестиции. Стоимость от 4 000 ₽.
-
-📖 <b>Полный FAQ с калькулятором и таблицей регионов:</b> https://серко.рф/faq.html
-"""
-
-# ============ ОБРАБОТЧИКИ ============
-@dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    await state.clear()
-    await remove_active_chat(uid)
-
-    if is_admin(uid):
-        await state.set_state(AdminState.idle)
-        await message.answer(
-            f"🔐 <b>Админ-панель</b>\n\nВы свободны.\nID: <code>{uid}</code>",
-            reply_markup=admin_idle_menu(),
-            parse_mode=ParseMode.HTML
-        )
-        logger.info(f"👑 Админ {uid} запустил бота")
+    h = m = None
+    hm = re.search(r"в\s+(\d{1,2})[:.](\d{2})", text)
+    honly = re.search(r"\bв\s+(\d{1,2})\s*(часа?|часов)?\b", text)
+    numw = next((w for w in NUMW if re.search(rf"\bв\s+{w}\b", text)), None)
+    daypart = re.search(r"(утром|утра|днём|днем|дня|вечером|вечера|ночью|ночи)", text)
+    if hm:
+        h, m = int(hm.group(1)), int(hm.group(2)); text = text.replace(hm.group(0), "")
+    elif honly:
+        h, m = int(honly.group(1)), 0; text = text.replace(honly.group(0), "")
+    elif numw:
+        h, m = NUMW[numw], 0; text = re.sub(rf"\bв\s+{numw}\b", "", text)
+    if h is not None and daypart:
+        base = DAYPARTS.get(daypart.group(1))
+        if base == 18 and h < 12: h += 12
+        if base == 0 and h < 12: h += 12
+        if base == 12 and h <= 6: h += 12
+        text = text.replace(daypart.group(0), "")
+    if h is None:
+        mp = re.search(r"в\s+полдень|полдень", text)
+        if mp:
+            h, m = 12, 0; text = re.sub(r"в\s+полдень|полдень", "", text)
+    if h is None:
+        target = now + timedelta(minutes=30); h, m = target.hour, target.minute
     else:
-        await update_client_info(uid, message.from_user.full_name, message.from_user.username)
-        await state.set_state(ClientState.menu)
-        await message.answer(
-            f"👨‍⚖️ <b>Серко Иван Иванович — юрист онлайн</b>\n\n"
-            f"Привет, {message.from_user.first_name}!\n\n"
-            f"Решаю юридические вопросы удалённо по всей России. 127+ решённых дел. "
-            f"Работаю самозанятым (ИНН 500918804320), без команды — вы общаетесь напрямую со мной.\n\n"
-            f"🌐 Сайт: https://серко.рф\n"
-            f"📞 +7 (977) 423-24-73\n\n"
-            f"Выберите действие:",
-            reply_markup=client_main_menu(),
-            parse_mode=ParseMode.HTML
-        )
-        logger.info(f"👤 Клиент {uid} запустил бота")
+        target = target.replace(hour=h, minute=m)
+        if target < now:
+            target += timedelta(days=1)
+            if day_label == "сегодня": day_label = "завтра"
+    text = re.sub(r"\s+", " ", text).strip(" .,;—-")
+    if not text:
+        text = "Напоминание"
+    return text, target, day_label
 
-@dp.message(Command("stop"))
-async def cmd_stop(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    uid = message.from_user.id
-    client_id = None
-    async with active_chats_lock:
-        for cid, aid in list(active_chats.items()):
-            if aid == uid:
-                client_id = cid
-                break
-    if client_id:
-        await end_chat_for_client(client_id, "Админ завершил диалог")
-        await end_chat_for_admin(uid, state, "Диалог завершён")
-    else:
-        await state.clear()
-        await state.set_state(AdminState.idle)
-        await message.answer("✅ Сброшено", reply_markup=admin_idle_menu())
+# ================== ГОЛОС -> ТЕКСТ ==================
+def transcribe_voice(file_id: str) -> str:
+    import speech_recognition as sr
+    fr = tg("getFile", file_id=file_id)
+    path = fr["result"]["file_path"]
+    with tempfile.TemporaryDirectory() as td:
+        ogg = os.path.join(td, "v.ogg"); wav = os.path.join(td, "v.wav")
+        r2 = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}", timeout=60)
+        with open(ogg, "wb") as f:
+            f.write(r2.content)
+        subprocess.run(["ffmpeg", "-y", "-i", ogg, "-ar", "16000", "-ac", "1", wav],
+                       capture_output=True)
+        rec = sr.Recognizer()
+        with sr.AudioFile(wav) as src:
+            audio = rec.record(src)
+        return rec.recognize_google(audio, language="ru-RU")
 
-@dp.message(Command("debug"), F.from_user.id == ADMIN_ID)
-async def cmd_debug(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    current_state = await state.get_state()
-    chats = await get_all_active_chats()
-    clients = await get_all_clients()
-    debug_text = f"🛠 <b>Debug info</b>\n\n👑 Админ: {uid}\n📌 Текущее состояние: {current_state}\n💬 Активных чатов: {len(chats)}\n"
-    for cid, aid in chats.items():
-        debug_text += f"   {cid} -> {aid}\n"
-    debug_text += f"👥 Всего клиентов: {len(clients)}\n"
-    banned = sum(1 for c in clients.values() if c.get("banned"))
-    debug_text += f"🔒 Забанено: {banned}\n"
-    await message.answer(debug_text, parse_mode=ParseMode.HTML)
+# ================== ЛОГИКА ЗАДАЧ ==================
+def add_task(d, user_id, text, source):
+    icon, cat = detect_cat(text)
+    ttext, due, day_label = parse_task(text)
+    if cat == "идея":
+        due, day_label = None, "заметка"   # идеи не напоминаем — просто храним
+    u = d["users"].setdefault(user_id, new_profile("Пользователь"))
+    tid = int(time.time() * 1000) % 10**10
+    u["tasks"].append({"id": tid, "text": ttext, "due": due.isoformat() if due else None,
+                       "time": due.strftime("%H:%M") if due else "", "day_label": day_label,
+                       "cat": cat, "icon": icon,
+                       "done": False, "status": "pending", "last_fire": "",
+                       "confirmed_at": "", "from": source})
+    return ttext, due, day_label, tid
 
-# ------------------------------------------------------------
-# 2. КЛИЕНТСКИЕ ХЕНДЛЕРЫ
-# ------------------------------------------------------------
-@dp.message(StateFilter(ClientState.menu), F.text == "📝 Оставить заявку")
-async def client_request(message: Message, state: FSMContext):
-    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username)
-    await message.answer(
-        "📞 <b>Заявка:</b>\n\n"
-        "📱 +7 (977) 423-24-73 (WhatsApp)\n"
-        "✈️ @BYIvanko\n"
-        "🤖 @ConsulLexbot\n"
-        "📧 333742917@mail.ru\n"
-        "🌐 https://серко.рф\n\n"
-        "⏰ Отвечаю в течение суток, в рабочие дни быстрее.",
-        reply_markup=client_main_menu(),
-        parse_mode=ParseMode.HTML
-    )
-
-@dp.message(StateFilter(ClientState.menu), F.text == "⚖️ Услуги")
-async def client_services(message: Message, state: FSMContext):
-    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username)
-    await message.answer(BOT_ANSWERS["услуги"], reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
-
-@dp.message(StateFilter(ClientState.menu), F.text == "💰 Цены")
-async def client_prices(message: Message, state: FSMContext):
-    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username)
-    await message.answer(BOT_ANSWERS["цена"], reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
-
-@dp.message(StateFilter(ClientState.menu), F.text == "📞 Контакты")
-async def client_contacts(message: Message, state: FSMContext):
-    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username)
-    await message.answer(BOT_ANSWERS["контакты"], reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
-
-@dp.message(StateFilter(ClientState.menu), F.text == "❓ Частые вопросы")
-async def client_faq(message: Message, state: FSMContext):
-    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username)
-    await message.answer(FAQ_TEXT, reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
-
-@dp.message(StateFilter(ClientState.menu), F.text == "👨‍⚖️ Связаться с юристом")
-async def client_call_lawyer(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    user = message.from_user
-    await update_client_info(uid, user.full_name, user.username)
-
-    if await is_client_banned(uid):
-        await message.answer(BANNED_MESSAGE, reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
-        logger.info(f"⛔ Забаненный клиент {uid} пытался вызвать юриста")
-        return
-
-    existing_admin = await get_active_chat(uid)
-    if existing_admin:
-        logger.info(f"🔄 Клиент {uid} переподключается.")
-        admin_state = get_fsm_context(existing_admin)
-        await end_chat_for_admin(existing_admin, admin_state, "Клиент начал новый диалог")
-        await end_chat_for_client(uid, "Старый диалог завершён (новое обращение)")
-
-    await state.set_state(ClientState.talking_to_lawyer)
-    await message.answer(
-        "⏳ <b>Соединяю с юристом...</b>\n\n"
-        "✅ Серко Иван Иванович получил уведомление.\n\n"
-        "Опишите ситуацию кратко — я отвечу лично:",
-        reply_markup=client_in_chat_menu(),
-        parse_mode=ParseMode.HTML
-    )
+def repeat_minutes(u):
     try:
-        await set_active_chat(uid, ADMIN_ID)
-        await safe_send_message(
-            ADMIN_ID,
-            f"🔔 <b>НОВЫЙ КЛИЕНТ!</b>\n\n"
-            f"👤 {user.full_name}\n🆔 <code>{uid}</code>\n📱 @{user.username or 'нет'}\n⏰ {datetime.now().strftime('%H:%M')}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✍️ Ответить", callback_data=f"start_chat:{uid}:{user.full_name}")]
-            ]),
-            parse_mode=ParseMode.HTML
-        )
-        logger.info(f"✅ Клиент {uid} подключён")
-    except Exception as e:
-        logger.error(f"❌ Ошибка при вызове юриста: {e}")
-        await message.answer("⚠️ Ошибка связи. Позвоните: +7 (977) 423-24-73", reply_markup=client_main_menu())
-        await state.set_state(ClientState.menu)
+        return int(u.get("repeat", 30))
+    except Exception:
+        return 30
 
-@dp.message(StateFilter(ClientState.talking_to_lawyer), F.text == "❌ Завершить разговор с юристом")
-async def client_end_chat(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    await update_client_info(uid, message.from_user.full_name, message.from_user.username)
-    admin_id = await get_active_chat(uid)
-    if admin_id:
-        admin_state = get_fsm_context(admin_id)
-        await end_chat_for_admin(admin_id, admin_state, "Клиент завершил диалог")
-    await end_chat_for_client(uid, "Разговор завершён")
+def handle_command(d, uid, chat, text, username=None):
+    u = d["users"].get(uid)
+    if text == "/start":
+        if not u:
+            d["users"][uid] = new_profile("Пользователь")
+        if username:
+            d["users"][uid]["username"] = username
+        save_data(d)
+        u = d["users"][uid]
+        send(chat, "👋 Привет! Я — «Мой день».\n\nПросто напишите или продиктуйте голосом:\n"
+                   "«купить молоко завтра в 10»\n«позвонить Ване в шесть вечера»\n«выпить воды» — через 30 минут\n\n"
+                   "Кнопки внизу 👇 помогут быстро управлять задачами.", rkb=main_kb())
+        return True
+    if text == "/help":
+        send(chat, "❓ Помощь\n\n"
+                   "• Любое сообщение — это новая задача\n"
+                   "• «купить...» — в список покупок, «идея...» — в заметки\n"
+                   "• Голосом: «мои задачи», «что сегодня», «что купить», «мои идеи»\n"
+                   "• /share_on — общий задачник для семьи\n"
+                   "• Несколько задачников: «задачник дяди», «мой задачник», /notebooks\n"
+                   "• Передать сообщение: «скажи Иван купить молоко»\n"
+                   "• Если 3 раза не подтверждено — бот оповещает семью\n"
+                   "• «завтра», «в среду», «в 6 вечера» — понимаю дату и время\n"
+                   "• Время не назвали — напомню через 30 минут\n"
+                   "• К задачам прикреплены кнопки: ✅ Сделал, ⏰ Отложить\n"
+                   "• /repeat 20 — как часто повторять напоминания (минуты)\n"
+                   "• /code — дать семье доступ к вашим задачам\n"
+                   "• /report — отчёт за день\n\n"
+                   "Семья получает ваш отчёт каждый день в 21:00.")
+        return True
+    if not u:
+        send(chat, "Сначала /start")
+        return True
+    if text in ("/tasks", "/ideas", "/shop"):
+        u = d["users"][active_owner(d, uid)]
+        ts = u["tasks"]
+        if text == "/shop":
+            ts = [t for t in ts if t.get("cat") == "покупка"]
+        notes = [t for t in ts if not t.get("due")]
+        timed = sorted([t for t in ts if t.get("due")], key=lambda t: t["due"])
+        if text == "/ideas":
+            timed = []
+        if not timed and not notes:
+            send(chat, "Здесь пока пусто. Напишите или продиктуйте — и я запомню!")
+            return True
+        lines = []
+        if timed:
+            lines.append("📋 Задачи:" if text != "/shop" else "🛒 Покупки:")
+            for t in timed[:15]:
+                lines.append(f"{'✅' if t['done'] else '•'} {t['day_label']} в {t['time']} — {t.get('icon','🗒️')} {t['text']}")
+        if notes:
+            lines.append("")
+            lines.append("💡 Идеи и заметки:")
+            for t in notes[:15]:
+                lines.append(f"{'✅' if t['done'] else '•'} {t.get('icon','💡')} {t['text']}")
+        send(chat, "\n".join(lines), rkb=main_kb())
+        return True
+    if text == "/report":
+        u = d["users"][active_owner(d, uid)]
+        done = [t for t in u["tasks"] if t["done"]]
+        lines = [f"📋 Отчёт за {datetime.now().strftime('%d.%m.%Y')} — {u['name']}:"]
+        for t in sorted(u["tasks"], key=lambda x: x["due"]):
+            lines.append(f"{'✅' if t['done'] else '⬜'} {t['day_label']} {t['time']} — {t['text']}"
+                         + (f" ({t['confirmed_at']})" if t["done"] else ""))
+        lines.append(f"Итог: {len(done)}/{len(u['tasks'])}")
+        send(chat, "\n".join(lines))
+        return True
+    if text == "/code":
+        import random
+        code = str(random.randint(1000, 9999))
+        d["links"][code] = {"uid": uid, "exp": (datetime.now() + timedelta(minutes=10)).isoformat()}
+        save_data(d)
+        send(chat, f"🔑 Код для семьи: {code}\nДействует 10 минут. Родной человек пишет мне: /link {code}")
+        return True
+    if text.startswith("/link"):
+        parts = text.split()
+        if len(parts) < 2:
+            send(chat, "Напишите: /link 1234")
+            return True
+        rec = d["links"].get(parts[1])
+        if not rec or datetime.fromisoformat(rec["exp"]) < datetime.now():
+            send(chat, "Код не найден или истёк. Попросите новый: /code")
+            return True
+        pu = d["users"].setdefault(rec["uid"], new_profile("Близкий"))
+        if uid not in pu["helpers"]:
+            pu["helpers"].append(uid)
+        save_data(d)
+        send(chat, f"🤝 Вы подключены к «{pu['name']}». Пишите мне задачи текстом — я передам. /report — отчёт. /unlink — отключиться.")
+        return True
+    if text == "/unlink":
+        n = 0
+        for uu in d["users"].values():
+            if uid in uu.get("helpers", []):
+                uu["helpers"].remove(uid); n += 1
+        save_data(d)
+        send(chat, "Отключено" if n else "Вы ни к кому не подключены")
+        return True
+    if text == "/notebooks":
+        acc = accessible(d, uid)
+        cur = active_owner(d, uid)
+        lines = ["📒 Ваши задачники:"]
+        for i, (ou, nm) in enumerate(acc, 1):
+            lines.append(f"{'▶️' if ou == cur else '•'} {i}. {nm}{' (общий)' if ou != uid else ''}")
+        lines.append("")
+        lines.append("Переключиться: «задачник дяди» или /use 2")
+        send(chat, "\n".join(lines), rkb=main_kb())
+        return True
+    if text.startswith("/use"):
+        parts = text.split()
+        acc = accessible(d, uid)
+        try:
+            ou, nm = acc[int(parts[1]) - 1]
+        except Exception:
+            send(chat, "Нет такого номера. Посмотрите: /notebooks")
+            return True
+        d["users"][uid]["active"] = ou if ou != uid else None
+        save_data(d)
+        send(chat, f"📒 Переключился на задачник «{nm}»", rkb=main_kb())
+        return True
+    if text == "/share_on":
+        if not u.get("helpers"):
+            send(chat, "Пока некому открывать: пусть семья подключится по коду (/code).")
+            return True
+        u["shared"] = True; save_data(d)
+        send(chat, "🤝 Общий задачник ВКЛЮЧЁН.\nСемья видит ваши задачи, может добавлять и нажимать «Сделал». Отключить: /share_off")
+        for h in u["helpers"]:
+            send(int(h), f"🤝 {u['name']} открыл(а) вам общий задачник. Пишите задачи — они попадут к {u['name']}, «мои задачи» — увидеть список.")
+        return True
+    if text == "/share_off":
+        u["shared"] = False; save_data(d)
+        send(chat, "🔒 Общий задачник выключен. Семья снова только добавляет задачи.")
+        return True
+    if text.startswith("/repeat"):
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            send(chat, "Напишите: /repeat 20")
+            return True
+        d["users"][active_owner(d, uid)]["repeat"] = int(parts[1]); save_data(d)
+        send(chat, f"✔ Буду напоминать каждые {parts[1]} минут, пока не подтвердите.")
+        return True
+    return False
 
-@dp.message(StateFilter(ClientState.talking_to_lawyer), F.text == "📞 Телефон для связи")
-async def client_phone_request(message: Message, state: FSMContext):
-    await message.answer("📞 +7 (977) 423-24-73\n🕐 9:00 — 21:00, ежедневно\n🌐 https://серко.рф")
+# ================== ОБРАБОТКА ОБНОВЛЕНИЙ ==================
+def render_tasks_for(u, title="📋 Задачи"):
+    notes = [t for t in u["tasks"] if not t.get("due")]
+    timed = sorted([t for t in u["tasks"] if t.get("due")], key=lambda t: t["due"])
+    lines = [f"{title} — {u['name']}:"]
+    for t in timed[:15]:
+        lines.append(f"{'✅' if t['done'] else '•'} {t['day_label']} в {t['time']} — {t.get('icon','🗒️')} {t['text']}")
+    if notes:
+        lines.append("")
+        lines.append("💡 Идеи и заметки:")
+        for t in notes[:15]:
+            lines.append(f"{'✅' if t['done'] else '•'} {t.get('icon','💡')} {t['text']}")
+    return "\n".join(lines)
 
-@dp.message(StateFilter(ClientState.talking_to_lawyer), F.contact)
-async def client_contact(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    user = message.from_user
-    contact = message.contact
-    await update_client_info(uid, user.full_name, user.username, increment_messages=True)
-    admin_id = await get_active_chat(uid)
-    if not admin_id:
-        await message.answer("⚠️ Связь с юристом потеряна.")
-        return
-    contact_info = f"📞 <b>Контакт от {user.full_name}:</b>\n"
-    contact_info += f"Имя: {contact.first_name} {contact.last_name or ''}\n"
-    contact_info += f"Номер: {contact.phone_number}\n"
-    if contact.user_id:
-        contact_info += f"User ID: {contact.user_id}"
-    await safe_send_message(admin_id, contact_info, parse_mode=ParseMode.HTML)
-    await message.reply("✅ Контакт отправлен юристу")
-
-@dp.message(StateFilter(ClientState.talking_to_lawyer))
-async def client_to_lawyer(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    user = message.from_user
-    await update_client_info(uid, user.full_name, user.username, increment_messages=True)
-
-    if await is_client_banned(uid):
-        admin_id = await get_active_chat(uid)
-        if admin_id:
-            admin_state = get_fsm_context(admin_id)
-            await end_chat_for_admin(admin_id, admin_state, "Клиент забанен во время диалога")
-        await end_chat_for_client(uid, "Диалог завершён (ограничение доступа)")
-        await message.answer(BANNED_MESSAGE, reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
-        return
-
-    admin_id = await get_active_chat(uid)
-    if not admin_id:
-        await message.answer("⚠️ Связь с юристом потеряна. Начните заново.", reply_markup=client_main_menu())
-        await state.set_state(ClientState.menu)
-        return
-
-    logger.info(f"📤 Сообщение от клиента {uid} доставлено админу {admin_id}")
-    admin_state = get_fsm_context(admin_id)
-    admin_data = await admin_state.get_data()
-    waiting_contacts = admin_data.get('waiting_contacts', False)
-    header = f"💬 <b>{user.full_name}</b>"
-    if waiting_contacts:
-        header += " [📞 КОНТАКТНЫЕ ДАННЫЕ]"
-        await admin_state.update_data(waiting_contacts=False)
-    header += "\n—\n"
-
-    sent = False
-    try:
-        if message.text:
-            sent = await safe_send_message(admin_id, header + message.text, parse_mode=ParseMode.HTML)
-        elif message.photo:
-            sent = await safe_send_photo(admin_id, message.photo[-1].file_id, caption=header + (message.caption or ""), parse_mode=ParseMode.HTML)
-        elif message.document:
-            sent = await safe_send_document(admin_id, message.document.file_id, caption=header + (message.caption or ""), parse_mode=ParseMode.HTML)
-        elif message.voice:
-            await safe_send_message(admin_id, f"{header}\n🎤 Голосовое:", parse_mode=ParseMode.HTML)
-            sent = await safe_send_voice(admin_id, message.voice.file_id, parse_mode=ParseMode.HTML)
-        else:
-            await message.reply("❌ Неподдерживаемый тип сообщения")
-            return
-
-        data = await state.get_data()
-        if not data.get('notified'):
-            await state.update_data(notified=True)
-            if sent:
-                await message.reply("✅ Отправлено юристу")
+def process_text(d, uid, chat, text, username=None):
+    if text in BUTTON_CMDS:
+        text = BUTTON_CMDS[text]
+    low = text.lower().strip()
+    # --- передать сообщение от моего имени ---
+    if low.startswith(("скажи ", "передай ", "напиши ")):
+        parts = text.split(maxsplit=2)
+        if len(parts) >= 3:
+            name = parts[1].lstrip("@").lower()
+            target = next((k for k, v in d["users"].items()
+                           if name in v.get("name", "").lower()
+                           or name == str(v.get("username") or "").lower()), None)
+            if target:
+                sender = d["users"].get(uid, {}).get("name", "Кто-то")
+                send(int(target), f"💬 {sender} просит передать:\n{parts[2]}")
+                send(chat, f"✔ Отправил «{d['users'][target]['name']}»")
             else:
-                await message.reply("⚠️ Не удалось отправить, попробуйте позже")
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки клиентом: {e}")
-        await message.reply("⚠️ Ошибка отправки")
-
-@dp.message(StateFilter(ClientState.menu), F.contact)
-async def client_contact_in_menu(message: Message, state: FSMContext):
-    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username, increment_messages=True)
-    await message.answer(
-        "📞 Получили ваш контакт! Нажмите 👨‍⚖️ Связаться с юристом для консультации.",
-        reply_markup=client_main_menu()
-    )
-
-@dp.message(StateFilter(ClientState.menu))
-async def client_bot_chat(message: Message, state: FSMContext):
-    await update_client_info(message.from_user.id, message.from_user.full_name, message.from_user.username, increment_messages=True)
-    text = message.text.lower() if message.text else ""
-    answer = None
-    for key, resp in BOT_ANSWERS.items():
-        if key in text:
-            answer = resp
-            break
-    if not answer:
-        answer = "🤔 Нажмите 👨‍⚖️ Связаться с юристом для помощи. Или посмотрите сайт: https://серко.рф"
-    await message.answer(answer, reply_markup=client_main_menu(), parse_mode=ParseMode.HTML)
-
-# ------------------------------------------------------------
-# 3. АДМИН: ДИАЛОГ С КЛИЕНТОМ
-# ------------------------------------------------------------
-@dp.callback_query(F.data.startswith("start_chat:"))
-async def admin_start_chat(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа", show_alert=True)
+                send(chat, "Такой человек боту ещё не писал. Пусть откроет бота и нажмёт /start.")
+        else:
+            send(chat, "Формат: скажи Иван купить молоко")
         return
-    logger.info(f"📞 Админ {callback.from_user.id} нажал 'Ответить'")
-    parts = callback.data.split(":")
-    client_id = int(parts[1])
-    client_name = parts[2] if len(parts) > 2 else "Клиент"
-    await update_client_info(client_id, client_name, None)
-
-    current_state = await state.get_state()
-    if current_state == AdminState.talking_to_client:
-        current_data = await state.get_data()
-        current_client = current_data.get('talking_to')
-        if current_client and current_client != client_id:
-            await callback.answer(
-                f"⚠️ Вы уже в чате с {current_data.get('client_name', 'Клиент')} (ID: {current_client})!\n"
-                f"Завершите текущий диалог перед ответом новому клиенту.",
-                show_alert=True
-            )
+    # --- переключение задачника ---
+    if low.startswith("задачник "):
+        name = low[9:].strip()
+        acc = accessible(d, uid)
+        target = uid if name in ("мой", "моё") else None
+        if target is None:
+            for ou, nm in acc:
+                if name in nm.lower():
+                    target = ou
+                    break
+        if target is not None:
+            d["users"].setdefault(uid, new_profile("Я"))["active"] = target if target != uid else None
+            save_data(d)
+            send(chat, f"📒 Теперь работаем с задачником «{d['users'][target]['name']}»", rkb=main_kb())
+        else:
+            send(chat, "Такой задачник не найден. Смотрите: /notebooks")
+        return
+    helper_of = next((k for k, v in d["users"].items() if uid in v.get("helpers", [])), None)
+    if helper_of:
+        cmd = match_cmd(text)
+        owner = d["users"][helper_of]
+        if cmd in ("/tasks", "/ideas", "/shop"):
+            send(chat, render_tasks_for(owner), rkb=main_kb())
             return
-
-    if await is_client_banned(client_id):
-        await callback.answer("⛔ Клиент забанен, невозможно начать диалог.", show_alert=True)
-        return
-
-    existing_admin = await get_active_chat(client_id)
-    if existing_admin and existing_admin != callback.from_user.id:
-        logger.warning(f"⚠️ Админ {callback.from_user.id} пытался подключиться к клиенту {client_id}, но он уже в чате с {existing_admin}")
-        await callback.answer("⚠️ Клиент уже находится в активном чате с другим админом.", show_alert=True)
-        return
-
-    if existing_admin == callback.from_user.id:
-        current_state = await state.get_state()
-        if current_state != AdminState.talking_to_client:
-            logger.info(f"🔄 Восстановление диалога для админа {callback.from_user.id} с клиентом {client_id}")
-            await state.set_state(AdminState.talking_to_client)
-            await state.update_data(talking_to=client_id, client_name=client_name, waiting_contacts=False)
-            await callback.message.answer(
-                f"🔄 <b>Диалог восстановлен</b>\n\nОбщение с <b>{client_name}</b>\nID: <code>{client_id}</code>",
-                reply_markup=admin_in_chat_menu(client_name),
-                parse_mode=ParseMode.HTML
-            )
-            await callback.answer("✅ Диалог восстановлен", show_alert=False)
-        else:
-            await callback.answer("✅ Вы уже в чате с этим клиентом.", show_alert=True)
-        return
-
-    await state.set_state(AdminState.talking_to_client)
-    await state.update_data(talking_to=client_id, client_name=client_name, waiting_contacts=False)
-    await set_active_chat(client_id, callback.from_user.id)
-    await callback.message.answer(
-        f"✍️ Общение с <b>{client_name}</b>\nID: <code>{client_id}</code>",
-        reply_markup=admin_in_chat_menu(client_name),
-        parse_mode=ParseMode.HTML
-    )
-    await safe_send_message(
-        client_id,
-        "👨‍⚖️ <b>Юрист подключился!</b>\n\nСерко Иван Иванович на связи. Опишите вашу ситуацию.",
-        parse_mode=ParseMode.HTML
-    )
-    await callback.answer("✅ Подключены")
-
-# ------------------------------------------------------------
-# 4. АДМИН: ГОРЯЧИЕ КЛАВИШИ В ДИАЛОГЕ
-# ------------------------------------------------------------
-@dp.message(StateFilter(AdminState.talking_to_client), F.text == "💰 Прайс-лист")
-async def admin_send_price_list(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    client_id = data.get('talking_to')
-    if not client_id:
-        await message.answer("⚠️ Нет активного клиента")
-        return
-    if not await get_active_chat(client_id):
-        await message.answer("⚠️ Клиент отключился")
-        await state.clear()
-        await state.set_state(AdminState.idle)
-        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
-        return
-    sent = await safe_send_message(client_id, PRICE_LIST, parse_mode=ParseMode.HTML)
-    if sent:
-        await message.answer("✅ Прайс-лист отправлен")
-    else:
-        await message.answer("❌ Не удалось отправить")
-
-@dp.message(StateFilter(AdminState.talking_to_client), F.text == "📞 Запросить контакты")
-async def admin_ask_contacts(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    client_id = data.get('talking_to')
-    if not client_id or not await get_active_chat(client_id):
-        await message.answer("⚠️ Клиент отключился")
-        await state.clear()
-        await state.set_state(AdminState.idle)
-        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
-        return
-    await state.update_data(waiting_contacts=True)
-    sent = await safe_send_message(client_id, ASK_CONTACTS, parse_mode=ParseMode.HTML)
-    if sent:
-        await message.answer("✅ Запрос контактов отправлен")
-    else:
-        await message.answer("❌ Не удалось отправить")
-
-@dp.message(StateFilter(AdminState.talking_to_client), F.text == "❌ Не можем помочь")
-async def admin_cannot_help(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    client_id = data.get('talking_to')
-    if not client_id or not await get_active_chat(client_id):
-        await message.answer("⚠️ Клиент отключился")
-        await state.clear()
-        await state.set_state(AdminState.idle)
-        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
-        return
-    sent = await safe_send_message(client_id, CANNOT_HELP, parse_mode=ParseMode.HTML)
-    if sent:
-        await message.answer("✅ Уведомление об отказе отправлено")
-    else:
-        await message.answer("❌ Не удалось отправить")
-
-@dp.message(StateFilter(AdminState.talking_to_client), F.text == "🔒 Заблокировать этого клиента")
-async def admin_ban_client_from_chat(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    client_id = data.get('talking_to')
-    client_name = data.get('client_name', 'Клиент')
-    if not client_id:
-        await message.answer("⚠️ Нет активного клиента")
-        return
-    await set_client_ban(client_id, True, reason="Заблокирован админом во время диалога")
-    logger.info(f"⛔ Админ {message.from_user.id} заблокировал клиента {client_id}")
-    await end_chat_for_client(client_id, "Админ заблокировал доступ к юристу")
-    await end_chat_for_admin(message.from_user.id, state, f"Клиент {client_name} заблокирован и диалог завершён")
-    await message.answer(f"🔒 Клиент {client_name} (ID: {client_id}) заблокирован.")
-
-@dp.message(StateFilter(AdminState.talking_to_client), F.text.startswith("❌ Завершить диалог с"))
-async def admin_end_chat(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    client_id = data.get('talking_to')
-    client_name = data.get('client_name', 'Клиент')
-    if client_id:
-        await end_chat_for_client(client_id, "Юрист завершил консультацию")
-        await end_chat_for_admin(message.from_user.id, state, f"Диалог с {client_name} завершён")
-
-@dp.message(StateFilter(AdminState.talking_to_client), F.text == "📊 Статистика")
-async def admin_stats_in_chat(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    chats = await get_all_active_chats()
-    total_clients = len(await get_all_clients())
-    banned_clients = 0
-    with db_cursor() as cur:
-        cur.execute("SELECT COUNT(*) as cnt FROM clients WHERE banned = 1")
-        row = cur.fetchone()
-        banned_clients = row["cnt"] if row else 0
-    await message.answer(
-        f"📊 <b>Статистика</b>\n\n👥 Всего клиентов: {total_clients}\n🔒 Заблокировано: {banned_clients}\n💬 Активных диалогов: {len(chats)}",
-        parse_mode=ParseMode.HTML
-    )
-
-@dp.message(StateFilter(AdminState.talking_to_client), F.text.in_(["👥 Управление клиентами", "🔄 Перезапустить бота"]))
-async def admin_blocked_in_chat(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    await message.answer(
-        "⚠️ <b>Сначала завершите диалог с клиентом!</b>\n\nИспользуйте кнопку ❌ Завершить диалог",
-        parse_mode=ParseMode.HTML
-    )
-
-# ------------------------------------------------------------
-# 5. АДМИН: ОБЩИЙ ОБРАБОТЧИК СООБЩЕНИЙ В ДИАЛОГЕ
-# ------------------------------------------------------------
-@dp.message(StateFilter(AdminState.talking_to_client))
-async def admin_to_client(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    client_id = data.get('talking_to')
-    if not client_id or not await get_active_chat(client_id):
-        await message.answer("⚠️ Клиент отключился")
-        await state.clear()
-        await state.set_state(AdminState.idle)
-        await message.answer("Вы свободны", reply_markup=admin_idle_menu())
-        return
-    await update_client_info(client_id, None, None, increment_messages=False)
-    header = "👨‍⚖️ <b>Серко И.И.:</b>\n\n"
-    sent = False
-    try:
-        if message.text:
-            sent = await safe_send_message(client_id, header + message.text, parse_mode=ParseMode.HTML)
-        elif message.photo:
-            sent = await safe_send_photo(client_id, message.photo[-1].file_id, caption=header + (message.caption or ""), parse_mode=ParseMode.HTML)
-        elif message.document:
-            sent = await safe_send_document(client_id, message.document.file_id, caption=header + (message.caption or ""), parse_mode=ParseMode.HTML)
-        elif message.voice:
-            await safe_send_message(client_id, header, parse_mode=ParseMode.HTML)
-            sent = await safe_send_voice(client_id, message.voice.file_id, parse_mode=ParseMode.HTML)
-        else:
-            await message.answer("❌ Неподдерживаемый тип")
+        if cmd == "/report":
+            done = sum(1 for t in owner["tasks"] if t["done"])
+            send(chat, f"📋 {owner['name']}: {done}/{len(owner['tasks'])} выполнено. Не выполнено: {len(owner['tasks'])-done}.")
             return
-        if sent:
-            await message.answer("✅ Отправлено")
-        else:
-            await message.answer("⚠️ Ошибка отправки")
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки админом: {e}")
-        await message.answer("❌ Ошибка отправки")
+        if not text.startswith("/"):
+            ttext, due, dl, tid = add_task(d, helper_of, text, "helper")
+            save_data(d)
+            when = f"{dl} в {due.strftime('%H:%M')}" if due else dl
+            send(chat, f"✔ Передал: {ttext} ({when})")
+            send(helper_of, f"📌 Новая задача от семьи: {ttext}\n{when}", kb=kb_task(tid))
+            if SEND_VOICE:
+                try:
+                    send_voice(helper_of, f"Новая задача от семьи: {ttext}")
+                except Exception:
+                    pass
+            return
+    cmd = match_cmd(text)
+    if cmd and not text.startswith("/"):
+        if handle_command(d, uid, chat, cmd, username):
+            return
+    if text.startswith("/"):
+        if handle_command(d, uid, chat, text.split("@")[0], username):
+            return
+    # обычная задача -> в активный задачник
+    ttext, due, dl, tid = add_task(d, active_owner(d, uid), text, "self")
+    save_data(d)
+    when = f"{dl} в {due.strftime('%H:%M')}" if due else dl
+    send(chat, f"📌 {ttext}\n{when}", kb=kb_task(tid))
+    if SEND_VOICE:
+        try:
+            send_voice(chat, f"Добавлено: {ttext}. {when}.")
+        except Exception as e:
+            log.warning(f"TTS: {e}")
 
-# ------------------------------------------------------------
-# 6. АДМИН: КНОПКИ В СОСТОЯНИИ IDLE
-# ------------------------------------------------------------
-@dp.message(F.from_user.id == ADMIN_ID, F.text == "📊 Статистика", StateFilter(AdminState.idle))
-async def admin_stats_idle(message: Message, state: FSMContext):
-    chats = await get_all_active_chats()
-    total_clients = len(await get_all_clients())
-    banned_clients = 0
-    with db_cursor() as cur:
-        cur.execute("SELECT COUNT(*) as cnt FROM clients WHERE banned = 1")
-        row = cur.fetchone()
-        banned_clients = row["cnt"] if row else 0
-    await message.answer(
-        f"📊 <b>Статистика</b>\n\n👥 Всего клиентов: {total_clients}\n🔒 Заблокировано: {banned_clients}\n💬 Активных диалогов: {len(chats)}",
-        parse_mode=ParseMode.HTML
-    )
-
-@dp.message(F.from_user.id == ADMIN_ID, F.text == "👥 Управление клиентами", StateFilter(AdminState.idle))
-async def admin_manage_clients_entry(message: Message, state: FSMContext):
-    await state.set_state(AdminState.managing_clients)
-    await message.answer(
-        "👥 <b>Управление клиентами</b>\n\nВыберите действие:",
-        reply_markup=admin_manage_menu(),
-        parse_mode=ParseMode.HTML
-    )
-
-@dp.message(F.from_user.id == ADMIN_ID, F.text == "🔄 Перезапустить бота", StateFilter(AdminState.idle))
-async def admin_restart(message: Message, state: FSMContext):
-    await message.answer("♻️ Перезапуск...")
-    logger.info(f"🔄 Админ {ADMIN_ID} инициировал перезапуск бота")
-    os.kill(os.getpid(), signal.SIGTERM)
-
-# ------------------------------------------------------------
-# 7. АДМИН: УПРАВЛЕНИЕ КЛИЕНТАМИ
-# ------------------------------------------------------------
-@dp.message(F.from_user.id == ADMIN_ID, StateFilter(AdminState.managing_clients), F.text == "◀️ Назад в админ-панель")
-async def admin_manage_back(message: Message, state: FSMContext):
-    await state.set_state(AdminState.idle)
-    await message.answer("🔐 <b>Админ-панель</b>\n\nВы свободны.", reply_markup=admin_idle_menu(), parse_mode=ParseMode.HTML)
-
-@dp.message(F.from_user.id == ADMIN_ID, StateFilter(AdminState.managing_clients), F.text == "📋 Список клиентов")
-async def admin_list_clients(message: Message, state: FSMContext):
-    clients = await get_all_clients()
-    if not clients:
-        await message.answer("📭 Нет ни одного клиента.")
+def handle_message(d, msg):
+    uid = str(msg["from"]["id"])
+    chat = msg["chat"]["id"]
+    username = msg.get("from", {}).get("username")
+    text = msg.get("text", "")
+    if text:
+        process_text(d, uid, chat, text, username)
         return
-    lines = ["📋 <b>Все клиенты:</b>\n"]
-    for uid, info in clients.items():
-        banned = "🔒" if info.get("banned") else "✅"
-        name = info.get("name", "Unknown")
-        username = info.get("username")
-        username_str = f" @{username}" if username else ""
-        last_seen = info.get("last_seen", "никогда")[5:16]
-        lines.append(f"{banned} <code>{uid}</code> - {name}{username_str}\n    👁 Посл.: {last_seen}")
-        if len(lines) > 30:
-            lines.append("... и ещё несколько")
-            break
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    if "voice" in msg:
+        try:
+            text = transcribe_voice(msg["voice"]["file_id"])
+        except Exception as e:
+            log.warning(f"STT: {e}")
+            if "aifc" in str(e) or "audioop" in str(e):
+                send(chat, "⚠️ Голос пока не работает: в Termux выполни pip install -U SpeechRecognition и перезапусти бота.")
+            else:
+                send(chat, "⚠️ Не разобрал голос. Напишите текстом или продиктуйте чётче.")
+            return
+        send(chat, f"🎤 Распознал: «{text}»")
+        process_text(d, uid, chat, text, username)
 
-@dp.message(F.from_user.id == ADMIN_ID, StateFilter(AdminState.managing_clients), F.text == "🔒 Заблокировать")
-async def admin_ban_client_request(message: Message, state: FSMContext):
-    await state.set_state(AdminState.waiting_client_id)
-    await state.update_data(ban_action="ban", reminder_action=False, reminder_target=None)
-    await message.answer("🔒 Введите ID клиента, которого нужно заблокировать:")
+def find_task(d, uid, tid):
+    """Задача у самого юзера, а если он помощник — у хозяина (общий задачник)."""
+    u = d["users"].get(uid)
+    if u:
+        t = next((x for x in u["tasks"] if x["id"] == tid), None)
+        if t:
+            return u, t
+    for uu in d["users"].values():
+        if uid in uu.get("helpers", []):
+            t = next((x for x in uu["tasks"] if x["id"] == tid), None)
+            if t:
+                return uu, t
+    return None, None
 
-@dp.message(F.from_user.id == ADMIN_ID, StateFilter(AdminState.managing_clients), F.text == "🔓 Разблокировать")
-async def admin_unban_client_request(message: Message, state: FSMContext):
-    await state.set_state(AdminState.waiting_client_id)
-    await state.update_data(ban_action="unban", reminder_action=False, reminder_target=None)
-    await message.answer("🔓 Введите ID клиента, которого нужно разблокировать:")
+def handle_callback(d, cb):
+    uid = str(cb["from"]["id"])
+    data = cb["data"]
+    tg("answerCallbackQuery", callback_query_id=cb["id"])
+    parts = data.split(":")
+    if parts[0] == "done":
+        tid = int(parts[1])
+        u, t = find_task(d, uid, tid)
+        if not t:
+            return
+        if t:
+            t["done"] = True; t["status"] = "done"
+            t["fires"] = 0
+            t["confirmed_at"] = datetime.now().strftime("%H:%M")
+            save_data(d)
+            tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
+               message_id=cb["message"]["message_id"],
+               text=f"✅ {t['text']} — выполнено в {t['confirmed_at']}")
+    elif parts[0] == "snz":
+        tid, mins = int(parts[1]), int(parts[2])
+        u, t = find_task(d, uid, tid)
+        if not t:
+            return
+        if t:
+            t["status"] = "snoozed"
+            t["snooze_until"] = (datetime.now() + timedelta(minutes=mins)).isoformat()
+            save_data(d)
+            tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
+               message_id=cb["message"]["message_id"],
+               text=f"⏰ «{t['text']}» — напомню через {mins} мин")
 
-@dp.message(F.from_user.id == ADMIN_ID, StateFilter(AdminState.managing_clients), F.text == "📝 Отправить напоминание")
-async def admin_remind_client_request(message: Message, state: FSMContext):
-    await state.set_state(AdminState.waiting_client_id)
-    await state.update_data(reminder_action=True, ban_action=None)
-    await message.answer("📝 Введите ID клиента, которому нужно отправить напоминание:")
+# ================== ПЛАНИРОВЩИК ==================
+def scheduler_tick(d):
+    now = datetime.now()
+    changed = False
+    for k, u in d["users"].items():
+        if not u.get("notify", True):
+            continue
+        for t in u["tasks"]:
+            if t["done"]:
+                continue
+            if t.get("status") == "snoozed":
+                if now >= datetime.fromisoformat(t["snooze_until"]):
+                    t["status"] = "pending"; t["last_fire"] = ""; changed = True
+                else:
+                    continue
+            if not t.get("due"):
+                continue  # идеи/заметки не напоминаем
+            due = datetime.fromisoformat(t["due"])
+            if due.date() != now.date():
+                continue
+            last = datetime.fromisoformat(t["last_fire"]) if t["last_fire"] else None
+            if now >= due and (last is None or (now - last).total_seconds() >= repeat_minutes(u) * 60):
+                t["status"] = "overdue"; t["last_fire"] = now.isoformat(); changed = True
+                t["fires"] = t.get("fires", 0) + 1
+                send(int(k), f"🔔 {t['text']}\nПора! Повторяю каждые {repeat_minutes(u)} мин, пока не подтвердите.",
+                     kb=kb_task(t["id"]))
+                if t["fires"] == 3 and u.get("helpers"):
+                    for h in u["helpers"]:
+                        send(int(h), f"⚠️ ВНИМАНИЕ: «{t['text']}» ({u['name']}) не подтверждается уже 3 раза. Может, позвоните?")
+                if SEND_VOICE:
+                    try:
+                        send_voice(int(k), f"Напоминаю: {t['text']}")
+                    except Exception as e:
+                        log.warning(f"TTS: {e}")
+        # отчёт помощникам в 21:00
+        if now.strftime("%H:%M") == "21:00" and u["tasks"] and not u.get("_rep_" + now.strftime("%d%m")):
+            done = sum(1 for t in u["tasks"] if t["done"])
+            for h in u.get("helpers", []):
+                send(int(h), f"📋 {u['name']}: {done}/{len(u['tasks'])} за сегодня. Не выполнено: {len(u['tasks'])-done}. Подробности: /report")
+            u["_rep_" + now.strftime("%d%m")] = True; changed = True
+    if changed:
+        save_data(d)
 
-@dp.message(F.from_user.id == ADMIN_ID, StateFilter(AdminState.waiting_client_id))
-async def admin_process_client_id(message: Message, state: FSMContext):
-    if not message.text or message.text.startswith('/'):
+# ================== HEALTH (для хостингов с пингом) ==================
+def run_health():
+    port = int(os.environ.get("PORT", 0))
+    if not port:
         return
-    if message.text in ["◀️ Назад в админ-панель", "📋 Список клиентов", "🔒 Заблокировать", "🔓 Разблокировать", "📝 Отправить напоминание"]:
-        return
-    data = await state.get_data()
-    ban_action = data.get('ban_action')
-    reminder_action = data.get('reminder_action')
-    try:
-        client_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ Некорректный ID. Введите число.")
-        return
-    client_info = await get_client_info(client_id)
-    if not client_info:
-        await message.answer(f"❌ Клиент с ID <code>{client_id}</code> не найден.", parse_mode=ParseMode.HTML)
-        await state.set_state(AdminState.managing_clients)
-        return
-    if ban_action:
-        if ban_action == "ban":
-            await set_client_ban(client_id, True, reason="Заблокирован админом через меню")
-            await message.answer(f"🔒 Клиент <code>{client_id}</code> заблокирован.", parse_mode=ParseMode.HTML)
-            admin_in_chat = await get_active_chat(client_id)
-            if admin_in_chat:
-                admin_state = get_fsm_context(admin_in_chat)
-                await end_chat_for_admin(admin_in_chat, admin_state, "Клиент заблокирован")
-                await end_chat_for_client(client_id, "Доступ к юристу заблокирован")
-        elif ban_action == "unban":
-            await set_client_ban(client_id, False)
-            await message.answer(f"🔓 Клиент <code>{client_id}</code> разблокирован.", parse_mode=ParseMode.HTML)
-        await state.set_state(AdminState.managing_clients)
-        return
-    elif reminder_action:
-        await state.set_state(AdminState.waiting_reminder_text)
-        await state.update_data(reminder_target=client_id, reminder_action=False)
-        await message.answer(f"📝 Введите текст напоминания для клиента <code>{client_id}</code>:", parse_mode=ParseMode.HTML)
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b"myday bot ok")
+        def log_message(self, *a):
+            pass
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", port), H).serve_forever(),
+                     daemon=True).start()
 
-@dp.message(F.from_user.id == ADMIN_ID, StateFilter(AdminState.waiting_reminder_text))
-async def admin_send_reminder_text(message: Message, state: FSMContext):
-    if not message.text or message.text.startswith('/'):
-        return
-    if message.text in ["◀️ Назад в админ-панель", "📋 Список клиентов", "🔒 Заблокировать", "🔓 Разблокировать", "📝 Отправить напоминание"]:
-        return
-    data = await state.get_data()
-    client_id = data.get('reminder_target')
-    if not client_id:
-        await state.set_state(AdminState.managing_clients)
-        return
-    reminder_text = message.text.strip()
-    if not reminder_text:
-        await message.answer("❌ Текст не может быть пустым.")
-        return
-    sent = await safe_send_message(
-        client_id,
-        f"📌 <b>Напоминание от администратора:</b>\n\n{reminder_text}",
-        parse_mode=ParseMode.HTML
-    )
-    if sent:
-        await message.answer(f"✅ Напоминание отправлено клиенту <code>{client_id}</code>.", parse_mode=ParseMode.HTML)
-    else:
-        await message.answer(f"❌ Не удалось отправить напоминание клиенту <code>{client_id}</code>.", parse_mode=ParseMode.HTML)
-    await state.set_state(AdminState.managing_clients)
-    await state.update_data(reminder_target=None)
-
-# ------------------------------------------------------------
-# 8. АДМИН: ЗАГЛУШКА ДЛЯ СОСТОЯНИЯ IDLE
-# ------------------------------------------------------------
-@dp.message(StateFilter(AdminState.idle))
-async def admin_idle(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    if message.text and message.text.startswith('/'):
-        return
-    await message.answer("ℹ️ Вы свободны. Ждите клиента или нажмите /start", reply_markup=admin_idle_menu())
-
-# ============ WEBHOOK ============
-async def handle_webhook(request: web.Request):
-    try:
-        data = await request.json()
-        await asyncio.wait_for(dp.feed_raw_update(bot, data), timeout=55.0)
-        return web.Response(text="OK", status=200)
-    except asyncio.TimeoutError:
-        return web.Response(text="OK", status=200)
-    except Exception as e:
-        logger.error(f"❌ Webhook error: {e}", exc_info=True)
-        return web.Response(text="Error", status=200)
-
-async def health(request: web.Request):
-    return web.Response(text="OK")
-
-async def root(request: web.Request):
-    return web.Response(text=f"Bot OK. Admin: {ADMIN_ID}")
-
-# ============ MAIN ============
-async def main():
-    port = int(os.getenv("PORT", "10000"))
-    app = web.Application()
-    app.router.add_get("/", root)
-    app.router.add_get("/health", health)
-    app.router.add_post("/webhook", handle_webhook)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"🚀 Сервер запущен на порту {port}")
-    asyncio.create_task(clean_old_clients())
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(webhook_url)
-        logger.info(f"✅ Webhook установлен: {webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка установки webhook: {e}")
-    await asyncio.Event().wait()
+# ================== ГЛАВНЫЙ ЦИКЛ ==================
+def main():
+    if BOT_TOKEN.startswith("ВСТАВЬ"):
+        raise SystemExit("Укажите BOT_TOKEN: export BOT_TOKEN=...")
+    run_health()
+    d = load_data()
+    offset = 0
+    last_check = 0
+    last_save_day = datetime.now().date()
+    log.info("Бот запущен")
+    while True:
+        try:
+            if time.time() - last_check >= CHECK_SEC:
+                last_check = time.time()
+                scheduler_tick(d)
+            # раз в сутки чистим старые выполненные задачи
+            if datetime.now().date() != last_save_day:
+                last_save_day = datetime.now().date()
+                for u in d["users"].values():
+                    u["tasks"] = [t for t in u["tasks"] if not t["done"] or (t.get("due") and t["due"][:10] >= str(last_save_day))]
+                    for k in list(u.keys()):
+                        if k.startswith("_rep_"): del u[k]
+                save_data(d)
+            res = tg("getUpdates", offset=offset, timeout=25)
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                if "message" in upd:
+                    handle_message(d, upd["message"])
+                elif "callback_query" in upd:
+                    handle_callback(d, upd["callback_query"])
+            time.sleep(1)
+        except Exception as e:
+            log.error(f"цикл: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
