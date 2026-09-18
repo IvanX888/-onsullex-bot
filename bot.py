@@ -31,7 +31,13 @@ logger = logging.getLogger(__name__)
 # ============ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "717849646"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://consullex-bot.onrender.com").strip()
+# Приоритет: явный WEBHOOK_URL -> автоопределение по RENDER_EXTERNAL_HOSTNAME -> fallback
+_render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+WEBHOOK_URL = (
+    os.getenv("WEBHOOK_URL", "").strip()
+    or (f"https://{_render_host}" if _render_host else "")
+    or "https://sonsullex-bot.onrender.com"
+).strip()
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN не установлен!")
